@@ -580,11 +580,12 @@ local scT = 0
 local scPressDir, scPressGoal = 1, nil
 local scPressSrcFn, scPressSrcV, scLastG = nil, nil, nil
 local scHinted = false
+local scPrevLV = nil -- прошлое значение выученного источника (ждём, пока зона устоится)
 local scAutoUntil = 0 -- пока идёт наше нажатие, запись ручных не пишет
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
-    scLast, scPressed, scCtx, scLastG, scHinted = nil, false, nil, nil, false
+    scLast, scPressed, scCtx, scLastG, scHinted, scPrevLV = nil, false, nil, nil, false, nil
     scT = 1 -- сразу перепоиск
 end
 
@@ -1011,7 +1012,7 @@ local function scStep(dt)
     end
 
     if stale or not scN or not scZ or not scGuiVisible(scN) then
-        scLast, scPressed, scCtx, scLastG, scHinted = nil, false, nil, nil, false
+        scLast, scPressed, scCtx, scLastG, scHinted, scPrevLV = nil, false, nil, nil, false, nil
         return
     end
 
@@ -1046,7 +1047,7 @@ local function scStep(dt)
 
     -- что за скилчек: сначала точно (по персонажу), потом по близости
     local ctx, rawId = scCtxFromChar()
-    if not ctx and scCtx == nil and os.clock() - scSeenAt > 0.25 then
+    if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
         scCtx = scCtxProximity() or "any"
     end
     ctx = ctx or scCtx
@@ -1060,6 +1061,10 @@ local function scStep(dt)
         local lv = src and scLearnVal() or nil
         if lv then
             -- выученный источник зоны (по твоим ручным попаданиям)
+            -- первый скилчек цепочки: значение источника ещё может быть от прошлой зоны -> ждём, пока устоится
+            local stable = scPrevLV ~= nil and math.abs(scDiff(lv, scPrevLV)) < 0.5
+            scPrevLV = lv
+            if not stable or os.clock() - scSeenAt < 0.12 then return end
             if src.kind == "G" or src.kind == "T" then
                 local check, c, size = scBase()
                 local ns = check and scTipAngle(c, size)
@@ -1112,7 +1117,9 @@ local function scStep(dt)
     local diffNext = scDiff(cur + curVel * (SC_CFG.lead + dt), target)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
-    if diffNow * diffNext <= 0 and math.abs(diffNow) < 40 then
+    local dirNow = curVel >= 0 and 1 or -1
+    local late = diffNow * dirNow > 0 and diffNow * dirNow <= (SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
+    if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
         print("[SC] press", tag, "id=" .. tostring(rawId), "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel))
         scPressed = true
         scPressTime = os.clock()
