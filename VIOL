@@ -498,7 +498,8 @@ local SC = {
 --   PlayerGui.SkillCheckPromptGui.Check.Goal  - зона
 --   идеальное попадание: Line.Rotation = Goal.Rotation + 104..114
 --   обычное попадание:   Line.Rotation = Goal.Rotation + 115 и дальше
--- Если промахивается - подкрути perfectCenter / normalCenter (градусы).
+-- Капкан: id = "Skillcheck-player", Goal.Rotation там всегда 0 (зона не в Goal) —
+-- источник зоны учится по твоим ручным попаданиям (SC_LEARN), см. ниже.
 local SC_CFG = {
     guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
@@ -510,16 +511,41 @@ local SC_CFG = {
     normalCenter = 127,    -- приземление ~ центр-5, т.е. ~122: заметно дальше белой (104..114). мажет мимо зоны -> -2, цепляет белую -> +2
     normalTol = 3,
     lead = 0.012,          -- упреждение в секундах; не доводит -> меньше, перелетает -> больше
-    trapSign = -1,         -- капкан: зона зеркальная (цель = Goal - центр)
+    trapSign = -1,         -- капкан (Goal живой): зона зеркальная (цель = Goal - центр)
     trapShift = 0,
-    trapExtra = -28,       -- капкан: сдвиг цели (градусы). минус = жмёт ПОЗЖЕ. подобрано тобой в меню (-28)
-    trapGeo = false,       -- старый режим по геометрии экрана (отключён)
-    trapGeoD = 0,
+    trapExtra = -28,       -- капкан (Goal живой): сдвиг цели (градусы). минус = жмёт ПОЗЖЕ
+    trapGeoD = 0,          -- капкан, запасной режим по экрану (белый квадрат): сдвиг цели в градусах
     ghExtra = 0,           -- гены/лечение: доп. сдвиг цели (градусы), 0 = как было изначально (идеал работал). плюс = жмёт позже
     genRange = 12,
     playerRange = 12,
     trapRange = 8,
+    learnMin = 4,          -- сколько ручных попаданий в капкане нужно, чтобы найти источник зоны
+    learnR = 0.99,         -- порог согласованности (1 = идеально; 0.99 ~ разброс 8°)
 }
+
+local LEARN_FILE = "vd_esp_trap_learn.json"
+-- src = {kind, path, sign, off}: цель(needle) = sign * value(src) + off
+--   kind R = GuiObject.Rotation, U = UIGradient.Rotation, G = угол элемента на экране, T = фикс. угол на экране
+local SC_LEARN = {recs = {}, src = nil}
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(LEARN_FILE) then
+            local d = HttpService:JSONDecode(readfile(LEARN_FILE))
+            if type(d) == "table" and type(d.kind) == "string" and type(d.path) == "string"
+                and type(d.sign) == "number" and type(d.off) == "number" then
+                SC_LEARN.src = d
+            end
+        end
+    end)
+end
+
+local function scLearnSave(data)
+    if not writefile then return end
+    pcall(function()
+        writefile(LEARN_FILE, HttpService:JSONEncode(data or {}))
+    end)
+end
 
 local function scMatch(name, words)
     name = string.lower(name)
@@ -552,12 +578,13 @@ local scN, scZ, scB = nil, nil, nil
 local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
 local scPressDir, scPressGoal = 1, nil
-local scPressGoalG, scPressCtx, scLastG = nil, nil, nil
+local scPressSrcFn, scPressSrcV, scLastG = nil, nil, nil
+local scHinted = false
 local scAutoUntil = 0 -- пока идёт наше нажатие, запись ручных не пишет
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
-    scLast, scPressed, scCtx, scLastG = nil, false, nil, nil
+    scLast, scPressed, scCtx, scLastG, scHinted = nil, false, nil, nil, false
     scT = 1 -- сразу перепоиск
 end
 
@@ -596,15 +623,38 @@ local function scIsWhite(o)
     return false
 end
 
--- возвращает: угол белого квадрата и угол конца стрелки (оба на экране), либо nil
-local function scGeom()
-    if not (scN and scZ) then return nil end
+-- check-фрейм, его центр на экране и размер
+local function scBase()
+    if not scN then return nil end
     local check = scN.Parent
     if not (check and check:IsA("GuiObject")) then return nil end
     local size = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y)
     if size <= 0 then return nil end
-    local c = visCenter(check)
+    return check, visCenter(check), size
+end
 
+-- конец стрелки на экране (точка) либо nil
+local function scTip(c, size)
+    local tip, tipDist = nil, size * 0.15
+    local cands = scN:GetDescendants()
+    table.insert(cands, scN)
+    for _, d in ipairs(cands) do
+        if d:IsA("GuiObject") and scGuiVisible(d) then
+            local pt = visCenter(d)
+            local dist = (pt - c).Magnitude
+            if dist > tipDist then tip, tipDist = pt, dist end
+        end
+    end
+    return tip
+end
+
+local function scTipAngle(c, size)
+    local pt = scTip(c, size)
+    return pt and scAngle(pt, c) or nil
+end
+
+-- белый квадрат зоны на экране (точка) либо nil
+local function scZoneWhite(check, c, size)
     local zone, zoneArea = nil, math.huge
     for _, d in ipairs(check:GetDescendants()) do
         if d:IsA("GuiObject") and d ~= scN and not d:IsDescendantOf(scN)
@@ -619,20 +669,176 @@ local function scGeom()
             end
         end
     end
-    if not zone then return nil end
+    return zone
+end
 
-    local tip, tipDist = nil, size * 0.15
-    local cands = scN:GetDescendants()
-    table.insert(cands, scN)
-    for _, d in ipairs(cands) do
-        if d:IsA("GuiObject") and scGuiVisible(d) then
-            local pt = visCenter(d)
-            local dist = (pt - c).Magnitude
-            if dist > tipDist then tip, tipDist = pt, dist end
-        end
-    end
+-- возвращает: угол белого квадрата и угол конца стрелки (оба на экране), либо nil
+local function scGeom()
+    local check, c, size = scBase()
+    if not check then return nil end
+    local zone = scZoneWhite(check, c, size)
+    if not zone then return nil end
+    local tip = scTip(c, size)
     if not tip then return nil end
     return scAngle(zone, c), scAngle(tip, c)
+end
+
+---------------------------------------------------------------------
+-- обучение капкана: ищем, какой элемент в Check несёт угол зоны
+---------------------------------------------------------------------
+local function scPathOf(d, root)
+    local parts = {}
+    local o = d
+    while o and o ~= root do
+        table.insert(parts, 1, o.Name)
+        o = o.Parent
+    end
+    return table.concat(parts, "/")
+end
+
+local function scResolve(root, path)
+    local o = root
+    for name in string.gmatch(path, "[^/]+") do
+        o = o and o:FindFirstChild(name)
+    end
+    return o
+end
+
+-- все числа-кандидаты в Check (без стрелки): Rotation, UIGradient.Rotation, угол на экране
+local function scSnapshot(check, c, size)
+    local vals = {}
+    for _, d in ipairs(check:GetDescendants()) do
+        if d ~= scN and not d:IsDescendantOf(scN) then
+            if d:IsA("GuiObject") then
+                local path = scPathOf(d, check)
+                vals["R:" .. path] = scNorm(d.Rotation)
+                if scGuiVisible(d) then
+                    local pt = visCenter(d)
+                    if (pt - c).Magnitude > size * 0.15 then
+                        vals["G:" .. path] = scAngle(pt, c)
+                    end
+                end
+            elseif d:IsA("UIGradient") then
+                vals["U:" .. scPathOf(d, check)] = scNorm(d.Rotation)
+            end
+        end
+    end
+    vals["T:screen"] = 0
+    return vals
+end
+
+local function scSrcValue(check, c, kind, path)
+    if kind == "T" then return 0 end
+    local o = scResolve(check, path)
+    if not o then return nil end
+    if kind == "R" then
+        return o:IsA("GuiObject") and scNorm(o.Rotation) or nil
+    elseif kind == "U" then
+        return o:IsA("UIGradient") and scNorm(o.Rotation) or nil
+    elseif kind == "G" then
+        if not (o:IsA("GuiObject") and scGuiVisible(o)) then return nil end
+        return scAngle(visCenter(o), c)
+    end
+    return nil
+end
+
+local function scLearnVal()
+    local src = SC_LEARN.src
+    if not src then return nil end
+    local check, c = scBase()
+    if not check then return nil end
+    return scSrcValue(check, c, src.kind, src.path)
+end
+
+-- ищет источник, у которого (needle - sign*value) одинаков во всех попаданиях
+local function scSolveWindow(list)
+    local n = #list
+    local best = nil
+    for key in pairs(list[n].vals) do
+        local kind, path = string.match(key, "^(%a):(.+)$")
+        if kind then
+            local useTip = (kind == "G" or kind == "T")
+            local ok = true
+            local vx, vy = 0, 0
+            for _, r in ipairs(list) do
+                local v = r.vals[key]
+                if v == nil or (useTip and r.tip == nil) then
+                    ok = false
+                    break
+                end
+                vx = vx + math.cos(math.rad(v))
+                vy = vy + math.sin(math.rad(v))
+            end
+            -- константный источник зону не отслеживает (кроме T: зона фиксирована на экране)
+            if ok and (kind == "T" or math.sqrt(vx * vx + vy * vy) / n < 0.98) then
+                for _, sign in ipairs(kind == "T" and {1} or {1, -1}) do
+                    local sx, sy = 0, 0
+                    for _, r in ipairs(list) do
+                        local base = useTip and r.tip or r.rot
+                        local o = math.rad(base - sign * r.vals[key])
+                        sx = sx + math.cos(o)
+                        sy = sy + math.sin(o)
+                    end
+                    local R = math.sqrt(sx * sx + sy * sy) / n
+                    local score = R + ((kind == "R" or kind == "U") and 0.0005 or 0)
+                    if R >= SC_CFG.learnR and (not best or score > best.score) then
+                        best = {
+                            kind = kind, path = path, sign = sign,
+                            off = math.deg(math.atan2(sy, sx)) % 360,
+                            score = score, R = R,
+                        }
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function scLearnSolve()
+    local recs = SC_LEARN.recs
+    local n = #recs
+    if n < SC_CFG.learnMin then
+        print(string.format("[SC] learn %d/%d - жми Space в идеал", n, SC_CFG.learnMin))
+        return
+    end
+    for k = n, SC_CFG.learnMin, -1 do
+        local list = {}
+        for i = n - k + 1, n do table.insert(list, recs[i]) end
+        local best = scSolveWindow(list)
+        if best then
+            SC_LEARN.src = {kind = best.kind, path = best.path, sign = best.sign, off = best.off}
+            scLearnSave(SC_LEARN.src)
+            print(string.format("[SC] trap learned: %s:%s sign=%d off=%.1f R=%.4f n=%d",
+                best.kind, best.path, best.sign, best.off, best.R, k))
+            return
+        end
+    end
+    print("[SC] learn: источник зоны не найден (n=" .. n .. "), жми ещё в идеал / кинь vd_rec.txt")
+end
+
+local function scLearnAdd(rot)
+    local check, c, size = scBase()
+    if not check then return end
+    local rec = {
+        rot = rot,
+        tip = scTipAngle(c, size),
+        vals = scSnapshot(check, c, size),
+    }
+    table.insert(SC_LEARN.recs, rec)
+    if #SC_LEARN.recs > 8 then table.remove(SC_LEARN.recs, 1) end
+    scLearnSolve()
+end
+
+local function scSnapString(vals)
+    local keys = {}
+    for k in pairs(vals) do table.insert(keys, k) end
+    table.sort(keys)
+    local out = {}
+    for _, k in ipairs(keys) do
+        table.insert(out, string.format("%s=%.1f", k, vals[k]))
+    end
+    return table.concat(out, " ")
 end
 
 local function scFindAll()
@@ -682,6 +888,7 @@ end
 -- id скилчека в персонаже -> тип. гены/лечение/капкан идут через одну таблицу и один путь
 -- (один gui, одни углы, один press); тип нужен только чтобы выбрать, какой тумблер его разрешает.
 -- если в игре id другой — допиши подстроку сюда, реальное имя печатается в F9 как "[SC] press ... id=".
+-- капкан приходит как "Skillcheck-player" -> по id не определяется, тип берётся по близости (капкан/атрибуты).
 local SC_IDS = {
     generator = {"gen"},
     heal = {"heal"},
@@ -804,7 +1011,7 @@ local function scStep(dt)
     end
 
     if stale or not scN or not scZ or not scGuiVisible(scN) then
-        scLast, scPressed, scCtx, scLastG = nil, false, nil, nil
+        scLast, scPressed, scCtx, scLastG, scHinted = nil, false, nil, nil, false
         return
     end
 
@@ -815,12 +1022,12 @@ local function scStep(dt)
         -- зона сменила угол, стрелка прыгнула/пошла назад, или вышел таймаут
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
-        local goalMoved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
-        if scPressCtx == "trap" and scPressGoalG then
-            local zs = scGeom()
-            goalMoved = goalMoved or (zs ~= nil and math.abs(scDiff(zs, scPressGoalG)) > 1.5)
+        local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
+        if scPressSrcFn and scPressSrcV then
+            local v = scPressSrcFn()
+            moved = moved or (v ~= nil and math.abs(scDiff(v, scPressSrcV)) > 1.5)
         end
-        if (waited > 0.25 and (goalMoved or math.abs(step) > 60 or step * scPressDir < -2)) or waited > 0.8 then
+        if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2)) or waited > 0.8 then
             scPressed = false
         end
         scLast = rot
@@ -846,53 +1053,73 @@ local function scStep(dt)
     if not ctx then return end
     if ctx ~= "any" and not SC[ctx] then return end
 
-    -- капкан: зону и стрелку берём с экрана (Goal.Rotation там не отражает реальную зону)
-    if SC_CFG.trapGeo and ctx == "trap" then
-        local zs, ns = scGeom()
-        if zs and ns then
+    local cur, curVel, target, srcFn, tag = rot, vel, nil, nil, ctx
+
+    if ctx == "trap" then
+        local src = SC_LEARN.src
+        local lv = src and scLearnVal() or nil
+        if lv then
+            -- выученный источник зоны (по твоим ручным попаданиям)
+            if src.kind == "G" or src.kind == "T" then
+                local check, c, size = scBase()
+                local ns = check and scTipAngle(c, size)
+                if not ns then return end
+                local g = scLastG
+                scLastG = ns
+                if not g then return end
+                cur, curVel = ns, scDiff(ns, g) / dt
+                if math.abs(curVel) < 20 then return end
+            end
+            target = scNorm(src.sign * lv + src.off)
+            if not SC.perfect then
+                -- обычное попадание: дальше идеала по ходу стрелки
+                target = target + (SC_CFG.normalCenter - SC_CFG.perfectCenter) * (curVel >= 0 and 1 or -1)
+            end
+            srcFn = scLearnVal
+            tag = "trap(learn)"
+        elseif math.abs(scDiff(scZ.Rotation, 0)) <= 0.5 then
+            -- Goal мёртвый (всегда 0): зону берём с экрана по белому квадрату
+            local zs, ns = scGeom()
+            if not (zs and ns) then
+                if not scHinted then
+                    scHinted = true
+                    warn("[SC] trap: источник зоны неизвестен. жми Space руками в идеал " .. SC_CFG.learnMin .. "+ раз - скрипт научится")
+                end
+                return
+            end
             local g = scLastG
             scLastG = ns
             if not g then return end
-            local gv = scDiff(ns, g) / dt
-            if math.abs(gv) < 20 then return end
-            local gTarget = (zs + SC_CFG.trapGeoD) % 360
-            local dNow = scDiff(ns, gTarget)
-            local dNext = scDiff(ns + gv * (SC_CFG.lead + dt), gTarget)
-            if dNow * dNext <= 0 and math.abs(dNow) < 40 then
-                print("[SC] press trap(geo)", "id=" .. tostring(rawId), "zone=" .. math.floor(zs), "needle=" .. math.floor(ns), "vel=" .. math.floor(gv), "goalRot=" .. math.floor(scZ.Rotation))
-                scPressed = true
-                scPressTime = os.clock()
-                scPressDir = gv >= 0 and 1 or -1
-                scPressGoal = scZ.Rotation
-                scPressGoalG = zs
-                scPressCtx = "trap"
-                scPress()
-            end
-            return
+            cur, curVel = ns, scDiff(ns, g) / dt
+            if math.abs(curVel) < 20 then return end
+            target = (zs + SC_CFG.trapGeoD) % 360
+            srcFn = function() return (scGeom()) end
+            tag = "trap(geo)"
         end
     end
 
-    local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
-    local tol = SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol
-    local sign, shift = 1, 0
-    local extra = SC_CFG.ghExtra -- гены / лечение / "any"
-    if ctx == "trap" then
-        sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CFG.trapExtra
+    if not target then
+        local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
+        local sign, shift = 1, 0
+        local extra = SC_CFG.ghExtra -- гены / лечение / "any"
+        if ctx == "trap" then
+            sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CFG.trapExtra
+        end
+        target = scZ.Rotation + shift + sign * (center + extra)
     end
-    local target = scZ.Rotation + shift + sign * (center + extra)
 
-    local diffNow = scDiff(rot, target)
-    local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
+    local diffNow = scDiff(cur, target)
+    local diffNext = scDiff(cur + curVel * (SC_CFG.lead + dt), target)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
     if diffNow * diffNext <= 0 and math.abs(diffNow) < 40 then
-        print("[SC] press", ctx, "id=" .. tostring(rawId), "rot=" .. math.floor(rot), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(vel))
+        print("[SC] press", tag, "id=" .. tostring(rawId), "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel))
         scPressed = true
         scPressTime = os.clock()
         scPressDir = vel >= 0 and 1 or -1
         scPressGoal = scZ.Rotation
-        scPressGoalG = nil
-        scPressCtx = ctx
+        scPressSrcFn = srcFn
+        scPressSrcV = srcFn and srcFn() or nil
         scPress()
     end
 end
@@ -918,13 +1145,16 @@ local function scDump()
                 if matched then
                     for _, d in ipairs(g:GetDescendants()) do
                         if d:IsA("GuiObject") then
-                            print("  ", d:GetFullName(), d.ClassName, "vis:", scGuiVisible(d), "rot:", d.Rotation)
+                            print("  ", d:GetFullName(), d.ClassName, "vis:", scGuiVisible(d), "rot:", d.Rotation, "size:", d.AbsoluteSize)
+                        elseif d:IsA("UIGradient") then
+                            print("  ", d:GetFullName(), d.ClassName, "rot:", d.Rotation, "offset:", d.Offset)
                         end
                     end
                 end
             end
         end
         print("context(char):", scCtxFromChar(), "| context(near):", scCtxProximity())
+        print("learned:", SC_LEARN.src and (SC_LEARN.src.kind .. ":" .. SC_LEARN.src.path) or "none")
         print("---- end ----")
     end)
 end
@@ -933,7 +1163,8 @@ end
 -- menu window
 ---------------------------------------------------------------------
 -- запись ручных попаданий: жми пробел сам во время скилчека
--- (в идеал) на капкане / гене / лечении. в F9 печатает needle/goal/diff.
+-- (в идеал) на капкане / гене / лечении. в F9 печатает needle/goal/diff,
+-- в капкане ещё и учит источник зоны (SC_LEARN). полный снимок -> vd_rec.txt
 connect(UserInputService.InputBegan, function(input)
     if input.KeyCode ~= SC_CFG.key or os.clock() < scAutoUntil then return end
     if not scN or not scN:IsDescendantOf(game) or not scZ or not scZ:IsDescendantOf(game) then
@@ -941,12 +1172,29 @@ connect(UserInputService.InputBegan, function(input)
     end
     if not scN or not scZ or not scGuiVisible(scN) then return end
     local ctx, rawId = scCtxFromChar()
+    ctx = ctx or scCtxProximity()
     local rot = scNorm(scN.Rotation)
     local goal = scNorm(scZ.Rotation)
     local line = string.format("[REC] ctx=%s id=%s needle=%.1f goal=%.1f diff=%.1f",
-        tostring(ctx or scCtxProximity()), tostring(rawId), rot, goal, (rot - goal) % 360)
+        tostring(ctx), tostring(rawId), rot, goal, (rot - goal) % 360)
     warn(line)
-    if appendfile then pcall(appendfile, "vd_rec.txt", line .. "\n") end
+
+    local check, c, size = scBase()
+    if check then
+        local tipA = scTipAngle(c, size)
+        local zs = scGeom()
+        warn(string.format("[REC] geo zone=%s tip=%s",
+            zs and string.format("%.1f", zs) or "nil",
+            tipA and string.format("%.1f", tipA) or "nil"))
+        if appendfile then
+            pcall(appendfile, "vd_rec.txt", line .. "\n  tip=" .. tostring(tipA) .. " " .. scSnapString(scSnapshot(check, c, size)) .. "\n")
+        end
+        if ctx == "trap" then
+            scLearnAdd(rot)
+        end
+    elseif appendfile then
+        pcall(appendfile, "vd_rec.txt", line .. "\n")
+    end
 end)
 
 local main = new("Frame", {
@@ -1663,6 +1911,13 @@ addToggle("Perfect hit (off = normal)", true, function(v)
 end, "scperfect")
 
 addButton("Dump skill check GUI (3s delay, F9)", scDump)
+
+addButton("Trap learn: reset (Space в идеал 4x)", function()
+    SC_LEARN.src = nil
+    SC_LEARN.recs = {}
+    scLearnSave({})
+    print("[SC] trap learn сброшен")
+end)
 
 addSection("Settings")
 
