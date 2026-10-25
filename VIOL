@@ -513,34 +513,12 @@ local SC_CFG = {
     trapSign = -1,         -- капкан: зона зеркальная (цель = Goal - центр). если тыкает не туда: пробуй trapSign = 1 и trapShift = 180
     trapShift = 0,
     trapExtra = -26,       -- капкан: сдвиг цели (градусы). минус = жмёт ПОЗЖЕ (стрелка идёт по часовой, sign=-1 инвертирует знак). замер по записи: нажатие приземлялось ~28 градусов до квадрата. не дотягивает -> -2, перелетает -> +2
-    ghExtra = 18,          -- гены/лечение: сдвиг цели (градусы). замер по записи: жало на ~15-20 градусов раньше квадрата. плюс = жмёт ПОЗЖЕ. докрутка кнопками в меню
+    trapGeoD = 0,          -- капкан (по белому квадрату на экране): сдвиг цели от центра квадрата, градусы. плюс = жмёт позже
+    ghExtra = 0,           -- гены/лечение: доп. сдвиг цели (градусы), 0 = как было изначально (идеал работал). плюс = жмёт позже
     genRange = 12,
     playerRange = 12,
     trapRange = 8,
 }
-
--- калибровка (сохраняется в файл, кнопки в меню правят на лету)
-local CAL_FILE = "vd_esp_cal.json"
-local SC_CAL = { gh = SC_CFG.ghExtra, trap = SC_CFG.trapExtra } -- gh = generator + heal
-if readfile and isfile then
-    pcall(function()
-        if isfile(CAL_FILE) then
-            local decoded = HttpService:JSONDecode(readfile(CAL_FILE))
-            if type(decoded) == "table" then
-                for k, v in pairs(decoded) do
-                    if SC_CAL[k] ~= nil and type(v) == "number" then SC_CAL[k] = v end
-                end
-            end
-        end
-    end)
-end
-
-local function saveCal()
-    if not writefile then return end
-    pcall(function()
-        writefile(CAL_FILE, HttpService:JSONEncode(SC_CAL))
-    end)
-end
 
 local function scMatch(name, words)
     name = string.lower(name)
@@ -572,11 +550,87 @@ end
 local scN, scZ, scB = nil, nil, nil
 local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
+local scPressDir, scPressGoal = 1, nil
+local scPressGoalG, scPressCtx, scLastG = nil, nil, nil
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
-    scLast, scPressed, scCtx = nil, false, nil
+    scLast, scPressed, scCtx, scLastG = nil, false, nil, nil
     scT = 1 -- сразу перепоиск
+end
+
+-- геометрия: реальное положение элемента на экране с учётом поворота всех родителей
+local function guiCenter(o)
+    return o.AbsolutePosition + o.AbsoluteSize / 2
+end
+
+local function visCenter(o)
+    local p = guiCenter(o)
+    local a = o.Parent
+    while a and a:IsA("GuiObject") do
+        local c = guiCenter(a)
+        local r = math.rad(a.Rotation)
+        local v = p - c
+        p = c + Vector2.new(v.X * math.cos(r) - v.Y * math.sin(r), v.X * math.sin(r) + v.Y * math.cos(r))
+        a = a.Parent
+    end
+    return p
+end
+
+-- угол по часовой от "вверх", градусы
+local function scAngle(p, c)
+    return math.deg(math.atan2(p.X - c.X, -(p.Y - c.Y))) % 360
+end
+
+local function scIsWhite(o)
+    if o:IsA("ImageLabel") or o:IsA("ImageButton") then
+        local c = o.ImageColor3
+        return o.ImageTransparency < 0.5 and c.R > 0.85 and c.G > 0.85 and c.B > 0.85
+    end
+    if o:IsA("Frame") then
+        local c = o.BackgroundColor3
+        return o.BackgroundTransparency < 0.5 and c.R > 0.85 and c.G > 0.85 and c.B > 0.85
+    end
+    return false
+end
+
+-- возвращает: угол белого квадрата и угол конца стрелки (оба на экране), либо nil
+local function scGeom()
+    if not (scN and scZ) then return nil end
+    local check = scN.Parent
+    if not (check and check:IsA("GuiObject")) then return nil end
+    local size = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y)
+    if size <= 0 then return nil end
+    local c = visCenter(check)
+
+    local zone, zoneArea = nil, math.huge
+    for _, d in ipairs(check:GetDescendants()) do
+        if d:IsA("GuiObject") and d ~= scN and not d:IsDescendantOf(scN)
+            and scGuiVisible(d) and scIsWhite(d) then
+            local sz = math.max(d.AbsoluteSize.X, d.AbsoluteSize.Y)
+            if sz > 0 and sz <= size * 0.3 then
+                local pt = visCenter(d)
+                if (pt - c).Magnitude > size * 0.3 then
+                    local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+                    if area < zoneArea then zone, zoneArea = pt, area end
+                end
+            end
+        end
+    end
+    if not zone then return nil end
+
+    local tip, tipDist = nil, size * 0.15
+    local cands = scN:GetDescendants()
+    table.insert(cands, scN)
+    for _, d in ipairs(cands) do
+        if d:IsA("GuiObject") and scGuiVisible(d) then
+            local pt = visCenter(d)
+            local dist = (pt - c).Magnitude
+            if dist > tipDist then tip, tipDist = pt, dist end
+        end
+    end
+    if not tip then return nil end
+    return scAngle(zone, c), scAngle(tip, c)
 end
 
 local function scFindAll()
@@ -747,14 +801,23 @@ local function scStep(dt)
     end
 
     if stale or not scN or not scZ or not scGuiVisible(scN) then
-        scLast, scPressed, scCtx = nil, false, nil
+        scLast, scPressed, scCtx, scLastG = nil, false, nil, nil
         return
     end
 
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
-        if os.clock() - scPressTime > 1.2 then
+        -- новый скилчек в цепочке (капкан даёт несколько подряд, gui при этом не скрывается):
+        -- зона сменила угол, стрелка прыгнула/пошла назад, или вышел таймаут
+        local waited = os.clock() - scPressTime
+        local step = scLast and scDiff(rot, scLast) or 0
+        local goalMoved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
+        if scPressCtx == "trap" and scPressGoalG then
+            local zs = scGeom()
+            goalMoved = goalMoved or (zs ~= nil and math.abs(scDiff(zs, scPressGoalG)) > 1.5)
+        end
+        if (waited > 0.25 and (goalMoved or math.abs(step) > 60 or step * scPressDir < -2)) or waited > 0.8 then
             scPressed = false
         end
         scLast = rot
@@ -769,7 +832,7 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then return end -- стрелка ещё не движется
+    if math.abs(vel) < 20 then scLastG = nil return end -- стрелка ещё не движется
 
     -- что за скилчек: сначала точно (по персонажу), потом по близости
     local ctx, rawId = scCtxFromChar()
@@ -780,12 +843,38 @@ local function scStep(dt)
     if not ctx then return end
     if ctx ~= "any" and not SC[ctx] then return end
 
+    -- капкан: зону и стрелку берём с экрана (Goal.Rotation там не отражает реальную зону)
+    if ctx == "trap" then
+        local zs, ns = scGeom()
+        if zs and ns then
+            local g = scLastG
+            scLastG = ns
+            if not g then return end
+            local gv = scDiff(ns, g) / dt
+            if math.abs(gv) < 20 then return end
+            local gTarget = (zs + SC_CFG.trapGeoD) % 360
+            local dNow = scDiff(ns, gTarget)
+            local dNext = scDiff(ns + gv * (SC_CFG.lead + dt), gTarget)
+            if dNow * dNext <= 0 and math.abs(dNow) < 40 then
+                print("[SC] press trap(geo)", "id=" .. tostring(rawId), "zone=" .. math.floor(zs), "needle=" .. math.floor(ns), "vel=" .. math.floor(gv), "goalRot=" .. math.floor(scZ.Rotation))
+                scPressed = true
+                scPressTime = os.clock()
+                scPressDir = gv >= 0 and 1 or -1
+                scPressGoal = scZ.Rotation
+                scPressGoalG = zs
+                scPressCtx = "trap"
+                scPress()
+            end
+            return
+        end
+    end
+
     local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
     local tol = SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol
     local sign, shift = 1, 0
-    local extra = SC_CAL.gh -- гены / лечение / "any"
+    local extra = SC_CFG.ghExtra -- гены / лечение / "any"
     if ctx == "trap" then
-        sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CAL.trap
+        sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CFG.trapExtra
     end
     local target = scZ.Rotation + shift + sign * (center + extra)
 
@@ -797,6 +886,10 @@ local function scStep(dt)
         print("[SC] press", ctx, "id=" .. tostring(rawId), "rot=" .. math.floor(rot), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(vel))
         scPressed = true
         scPressTime = os.clock()
+        scPressDir = vel >= 0 and 1 or -1
+        scPressGoal = scZ.Rotation
+        scPressGoalG = nil
+        scPressCtx = ctx
         scPress()
     end
 end
@@ -1551,30 +1644,6 @@ end, "scperfect")
 
 addButton("Dump skill check GUI (3s delay, F9)", scDump)
 
--- докрутка тайминга: gh = гены + лечение, trap = капкан
--- gh: плюс = жмёт ПОЗЖЕ. trap: плюс = жмёт РАНЬШЕ (зеркало, sign = -1)
-local calBtns = {}
-local function calRefresh()
-    for _, e in ipairs(calBtns) do
-        e.btn.Text = string.format("%s: жать %s (сейчас %d°)", e.name, e.word, SC_CAL[e.key])
-    end
-end
-
-local function addCal(name, key, step, word)
-    local btn = addButton("", function()
-        SC_CAL[key] = SC_CAL[key] + step
-        saveCal()
-        calRefresh()
-    end)
-    table.insert(calBtns, {btn = btn, name = name, key = key, word = word})
-end
-
-addCal("Gen/Heal", "gh", 2, "ПОЗЖЕ +2°")
-addCal("Gen/Heal", "gh", -2, "РАНЬШЕ -2°")
-addCal("Trap", "trap", -2, "ПОЗЖЕ -2°")
-addCal("Trap", "trap", 2, "РАНЬШЕ +2°")
-calRefresh()
-
 addSection("Settings")
 
 addToggle("Names / distance", true, function(v)
@@ -1650,7 +1719,6 @@ end)
 ---------------------------------------------------------------------
 env.__VDEspCleanup = function()
     saveColors()
-    saveCal()
     for k in pairs(ESP) do
         if k ~= "names" then ESP[k] = false end
     end
