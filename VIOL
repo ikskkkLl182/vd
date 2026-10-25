@@ -298,17 +298,16 @@ local ESP = {
     names = true,
 }
 
--- object categories: Model names that contain one of the words (lowercase).
--- If an object is not highlighted, press "Dump map info", look at the real
--- names in the console (F9) and add them to the matching "words" list.
 -- names  - точные имена (lowercase), words - подстроки в имени,
 -- anchor - имя части внутри объекта, к которой цепляется метка,
--- highlight - подсвечивать контуром (у Roblox лимит ~31 Highlight, поэтому не всем).
+-- highlight - контур; у Roblox лимит ~31 Highlight на экран, поэтому hlCap на категорию:
+-- 12 + 8 + 4 + игроки (~5) влезает. Если объект не подсвечен — "Dump map info" (F9),
+-- смотри реальные имена и допиши в words/names.
 local ESP_CATS = {
-    generators = {names = {"generator"}, anchor = "HitBox", label = "Generator", highlight = true},
-    hooks = {names = {"hook"}, anchor = "HookPoint", label = "Hook", highlight = true},
-    gates = {words = {"gate", "exit"}, label = "Gate", highlight = true},
-    pallets = {names = {"palletwrong", "palletalien", "pallet"}, anchor = "HumanoidRootPart", label = "Pallet"},
+    generators = {words = {"generator"}, anchor = "HitBox", label = "Generator", highlight = true, hlCap = 12},
+    hooks = {words = {"hook"}, anchor = "HookPoint", label = "Hook", highlight = true, hlCap = 8},
+    gates = {words = {"gate", "exit"}, label = "Gate", highlight = true, hlCap = 4},
+    pallets = {words = {"pallet"}, anchor = "HumanoidRootPart", label = "Pallet"},
     windows = {names = {"window"}, anchor = "inviswall", label = "Window"},
 }
 
@@ -457,27 +456,51 @@ local function espNameHas(inst, cat)
     return false
 end
 
+local function espHlCount(cat)
+    local n = 0
+    for _, it in pairs(espItems) do
+        if it.cat == cat and it.hl then n = n + 1 end
+    end
+    return n
+end
+
+-- есть ли выше по дереву Model/BasePart с тем же совпадением (берём только самый верхний)
+local function espHasMatchingAncestor(obj, cat)
+    local p = obj.Parent
+    while p and p ~= workspace do
+        if (p:IsA("Model") or p:IsA("BasePart")) and espNameHas(p, cat) then return true end
+        p = p.Parent
+    end
+    return false
+end
+
+-- внутри персонажа (аксессуары и т.п.) не трогаем
+local function espInsideCharacter(obj)
+    local p = obj.Parent
+    while p and p ~= workspace do
+        if p:FindFirstChildOfClass("Humanoid") then return true end
+        p = p.Parent
+    end
+    return false
+end
+
 local function espConsider(obj)
     if espItems[obj] then return end
-    if not (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder")) then return end
+    if not (obj:IsA("Model") or obj:IsA("BasePart")) then return end -- папки не берём: "Generators" folder ломала дедуп
     if obj:FindFirstChildOfClass("Humanoid") then return end
     for cat, def in pairs(ESP_CATS) do
         if ESP[cat] and espNameHas(obj, cat) then
-            local part = def.anchor and obj:FindFirstChild(def.anchor)
+            if espHasMatchingAncestor(obj, cat) or espInsideCharacter(obj) then return end
+
+            local part = def.anchor and obj:FindFirstChild(def.anchor, true)
             if not (part and part:IsA("BasePart")) then
-                -- нет якорной части: пропускаем, если выше есть такой же объект (вложенные детали)
-                local p = obj.Parent
-                while p and p ~= workspace do
-                    if espNameHas(p, cat) then return end
-                    p = p.Parent
-                end
                 part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
             end
             if not part then return end
 
             local color = ESPColors[cat]
             local hl = nil
-            if def.highlight and obj:IsA("PVInstance") then
+            if def.highlight and espHlCount(cat) < (def.hlCap or 8) then
                 hl = new("Highlight", {
                     Adornee = obj,
                     FillColor = color,
@@ -507,13 +530,22 @@ local function espConsider(obj)
     end
 end
 
+-- скан по всему workspace, порциями, чтобы не фризить (особенно на телефоне)
+local espScanning = false
 local function espScan()
-    local root = workspace:FindFirstChild("Map") or workspace
-    for _, obj in ipairs(root:GetDescendants()) do
-        if obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder") then
-            espConsider(obj)
+    if espScanning then return end
+    espScanning = true
+    task.spawn(function()
+        local n = 0
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if obj:IsA("Model") or obj:IsA("BasePart") then
+                pcall(espConsider, obj)
+            end
+            n = n + 1
+            if n % 1500 == 0 then task.wait() end
         end
-    end
+        espScanning = false
+    end)
 end
 
 local function espAnyObject()
@@ -565,7 +597,7 @@ end
 
 connect(workspace.DescendantAdded, function(obj)
     if not espAnyObject() then return end
-    if obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder") then
+    if obj:IsA("Model") or obj:IsA("BasePart") then
         local relevant = false
         for cat in pairs(ESP_CATS) do
             if ESP[cat] and espNameHas(obj, cat) then
@@ -636,7 +668,7 @@ local SC = {
     perfect = true,    -- true = идеальное попадание (белая зона), false = обычное
 }
 
--- Структура скилчека в игре (по открытым скриптам для VD):
+-- Структура скилчека в игре:
 --   PlayerGui.SkillCheckPromptGui.Check.Line  - стрелка
 --   PlayerGui.SkillCheckPromptGui.Check.Goal  - зона
 --   идеальное попадание: Line.Rotation = Goal.Rotation + 104..114
@@ -796,22 +828,24 @@ local function scCtxProximity()
     return bestKind
 end
 
+-- VirtualInputManager первым (реальный ввод), firesignal только если VIM нет/упал:
+-- firesignal на InputBegan не кидает ошибку даже когда игра фейковый InputObject игнорит
 local function scPress()
     task.spawn(function()
-        local fired = false
-        if firesignal then
-            fired = pcall(function()
+        local sent = false
+        if VirtualInputManager then
+            sent = pcall(function()
+                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+                task.wait(0.03)
+                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+            end)
+        end
+        if not sent and firesignal then
+            pcall(function()
                 firesignal(UserInputService.InputBegan, {
                     KeyCode = SC_CFG.key,
                     UserInputType = Enum.UserInputType.Keyboard,
                 }, false)
-            end)
-        end
-        if not fired and VirtualInputManager then
-            pcall(function()
-                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
-                task.wait(0.03)
-                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
             end)
         end
         if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
@@ -882,6 +916,7 @@ local function scStep(dt)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or math.abs(diffNext) <= tol then
+        print("[SC] press", ctx, math.floor(rot), math.floor(target))
         scPressed = true
         scPressTime = os.clock()
         scPress()
@@ -1479,20 +1514,38 @@ local modalBtn = new("TextButton", {
     Text = "",
     Modal = true,
 }, main)
+
+-- состояние мыши запоминаем в момент первого форса и возвращаем при закрытии,
+-- иначе после меню камера остаётся в Default и крутится только с ПКМ
 local prevMouseIcon = UserInputService.MouseIconEnabled
+local prevMouseBehavior = UserInputService.MouseBehavior
+local mouseForced = false
+
+local function mouseRelease()
+    if not mouseForced then
+        prevMouseIcon = UserInputService.MouseIconEnabled
+        prevMouseBehavior = UserInputService.MouseBehavior
+        mouseForced = true
+    end
+end
+
+local function mouseRestore()
+    if not mouseForced then return end
+    mouseForced = false
+    UserInputService.MouseIconEnabled = prevMouseIcon
+    UserInputService.MouseBehavior = prevMouseBehavior
+end
 
 local function setOpen(v)
-    local was = opened
     opened = v
     if v then
-        if not was then prevMouseIcon = UserInputService.MouseIconEnabled end
         modalBtn.Modal = true
         main.Visible = true
         tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
     else
         closePicker()
         modalBtn.Modal = false
-        UserInputService.MouseIconEnabled = prevMouseIcon
+        mouseRestore()
         tween(scale, {Scale = 0}, 0.2)
         task.delay(0.22, function()
             if not opened then main.Visible = false end
@@ -1704,6 +1757,7 @@ connect(RunService.RenderStepped, function(dt)
 
     -- пока меню открыто - курсор виден и не заблокирован
     if opened then
+        mouseRelease() -- сначала запоминаем состояние игры, потом форсим
         if not UserInputService.MouseIconEnabled then
             UserInputService.MouseIconEnabled = true
         end
@@ -1726,9 +1780,7 @@ env.__VDEspCleanup = function()
     espClear()
 
     SC.generator, SC.heal, SC.trap = false, false, false
-    if opened then
-        pcall(function() UserInputService.MouseIconEnabled = prevMouseIcon end)
-    end
+    pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
