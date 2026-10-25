@@ -507,7 +507,7 @@ local SC_CFG = {
     key = Enum.KeyCode.Space,
     perfectCenter = 111,   -- точка нажатия в идеальной зоне (104..114); не доводит -> +1..2, перелетает -> -1..2
     perfectTol = 3.5,      -- допуск для идеального попадания
-    normalCenter = 118,    -- точка обычного попадания (чуть после 115)
+    normalCenter = 123,    -- нажатие реально приземляется на ~5 градусов раньше центра (упреждение+кадр), поэтому 123 = попадание ~118, после белой (104..114); попадает на белую -> +2, мимо зоны -> -2
     normalTol = 3,
     lead = 0.012,          -- упреждение в секундах; не доводит -> меньше, перелетает -> больше
     genRange = 12,
@@ -590,18 +590,26 @@ local function scFindAll()
 end
 
 -- точный способ: при скилчеке в персонаже появляется объект "Skillcheck-..."
+-- id скилчека в персонаже -> тип. гены/лечение/капкан идут через одну таблицу и один путь
+-- (один gui, одни углы, один press); тип нужен только чтобы выбрать, какой тумблер его разрешает.
+-- если в игре id другой — допиши подстроку сюда, реальное имя печатается в F9 как "[SC] press ... id=".
+local SC_IDS = {
+    generator = {"gen"},
+    heal = {"heal"},
+    trap = {"trap", "free", "escape", "bear"},
+}
+local SC_ORDER = {"generator", "heal", "trap"}
+
 local function scCtxFromChar()
     local chr = player.Character
     if not chr then return nil end
     for _, c in ipairs(chr:GetChildren()) do
         local n = string.lower(c.Name)
         if string.find(n, "skillcheck", 1, true) then
-            if string.find(n, "gen", 1, true) then return "generator" end
-            if string.find(n, "heal", 1, true) then return "heal" end
-            if string.find(n, "trap", 1, true) or string.find(n, "free", 1, true)
-                or string.find(n, "escape", 1, true) or string.find(n, "bear", 1, true) then
-                return "trap"
+            for _, kind in ipairs(SC_ORDER) do
+                if scMatch(n, SC_IDS[kind]) then return kind, c.Name end
             end
+            return nil, c.Name
         end
     end
     return nil
@@ -724,7 +732,7 @@ local function scStep(dt)
     if math.abs(vel) < 20 then return end -- стрелка ещё не движется
 
     -- что за скилчек: сначала точно (по персонажу), потом по близости
-    local ctx = scCtxFromChar()
+    local ctx, rawId = scCtxFromChar()
     if not ctx and scCtx == nil and os.clock() - scSeenAt > 0.25 then
         scCtx = scCtxProximity() or "any"
     end
@@ -741,7 +749,7 @@ local function scStep(dt)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
     if diffNow * diffNext <= 0 and math.abs(diffNow) < 40 then
-        print("[SC] press", ctx, math.floor(rot), math.floor(target))
+        print("[SC] press", ctx, "id=" .. tostring(rawId), math.floor(rot), math.floor(target))
         scPressed = true
         scPressTime = os.clock()
         scPress()
