@@ -510,9 +510,9 @@ local SC_CFG = {
     normalCenter = 127,    -- приземление ~ центр-5, т.е. ~122: заметно дальше белой (104..114). мажет мимо зоны -> -2, цепляет белую -> +2
     normalTol = 3,
     lead = 0.012,          -- упреждение в секундах; не доводит -> меньше, перелетает -> больше
-    trapSign = 1,          -- капкан теперь идёт тем же путём, что и ген: без зеркала и сдвигов
+    trapSign = -1,         -- капкан: зона зеркальная (цель = Goal - центр)
     trapShift = 0,
-    trapExtra = 0,         -- капкан: доп. сдвиг цели (градусы), 0 = как у гена. плюс = жмёт позже
+    trapExtra = -28,       -- капкан: сдвиг цели (градусы). минус = жмёт ПОЗЖЕ. подобрано тобой в меню (-28)
     trapGeo = false,       -- старый режим по геометрии экрана (отключён)
     trapGeoD = 0,
     ghExtra = 0,           -- гены/лечение: доп. сдвиг цели (градусы), 0 = как было изначально (идеал работал). плюс = жмёт позже
@@ -553,6 +553,7 @@ local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
 local scPressDir, scPressGoal = 1, nil
 local scPressGoalG, scPressCtx, scLastG = nil, nil, nil
+local scAutoUntil = 0 -- пока идёт наше нажатие, запись ручных не пишет
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
@@ -752,6 +753,7 @@ end
 -- VirtualInputManager первым (реальный ввод), firesignal только если VIM нет/упал:
 -- firesignal на InputBegan не кидает ошибку даже когда игра фейковый InputObject игнорит
 local function scPress()
+    scAutoUntil = os.clock() + 0.2
     task.spawn(function()
         local sent = false
         if VirtualInputManager then
@@ -930,6 +932,23 @@ end
 ---------------------------------------------------------------------
 -- menu window
 ---------------------------------------------------------------------
+-- запись ручных попаданий: жми пробел сам во время скилчека
+-- (в идеал) на капкане / гене / лечении. в F9 печатает needle/goal/diff.
+connect(UserInputService.InputBegan, function(input)
+    if input.KeyCode ~= SC_CFG.key or os.clock() < scAutoUntil then return end
+    if not scN or not scN:IsDescendantOf(game) or not scZ or not scZ:IsDescendantOf(game) then
+        scFindAll()
+    end
+    if not scN or not scZ or not scGuiVisible(scN) then return end
+    local ctx, rawId = scCtxFromChar()
+    local rot = scNorm(scN.Rotation)
+    local goal = scNorm(scZ.Rotation)
+    local line = string.format("[REC] ctx=%s id=%s needle=%.1f goal=%.1f diff=%.1f",
+        tostring(ctx or scCtxProximity()), tostring(rawId), rot, goal, (rot - goal) % 360)
+    warn(line)
+    if appendfile then pcall(appendfile, "vd_rec.txt", line .. "\n") end
+end)
+
 local main = new("Frame", {
     Name = "Main",
     Size = UDim2.fromOffset(380, 470),
