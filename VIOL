@@ -568,6 +568,249 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
+-- auto skill check
+---------------------------------------------------------------------
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+local SC = {
+    generator = false, -- генераторы
+    heal = false,      -- лечение тиммейтов
+    trap = false,      -- освобождение из капкана
+    perfect = true,    -- true = идеальное попадание (белая зона), false = обычное
+}
+
+-- Настройки. Если не попадает / не находит скилчек: нажми
+-- "Dump skill check GUI" в меню, запусти скилчек и поправь имена/смещения тут.
+local SC_CFG = {
+    guiWords = {"skillcheck", "skill", "check"},
+    needleWords = {"needle", "line", "pointer", "hand", "arrow", "marker"},
+    zoneWords = {"goal", "zone", "success", "target", "good"},
+    perfectWords = {"perfect", "great", "white", "bonus"},
+    key = Enum.KeyCode.Space,
+    zoneOffset = 0,        -- смещение угла обычной зоны относительно стрелки (градусы)
+    perfectOffset = 0,     -- смещение угла белой зоны (градусы)
+    zoneHalfWidth = 18,    -- половина ширины обычной зоны (градусы)
+    perfectHalfWidth = 5,  -- допуск для идеального попадания (градусы)
+    lead = 0.03,           -- упреждение в секундах (компенсация задержки)
+    genRange = 12,
+    playerRange = 12,
+    trapRange = 8,
+}
+
+local function scMatch(name, words)
+    name = string.lower(name)
+    for _, w in ipairs(words) do
+        if string.find(name, w, 1, true) then return true end
+    end
+    return false
+end
+
+local function scGuiVisible(obj)
+    local p = obj
+    while p do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") and not p.Enabled then return false end
+        p = p.Parent
+    end
+    return true
+end
+
+local function scNorm(a)
+    return a % 360
+end
+
+-- кратчайшая разница углов a - b в диапазоне [-180, 180)
+local function scDiff(a, b)
+    return ((a - b + 180) % 360) - 180
+end
+
+local scN, scZ, scP, scB = nil, nil, nil, nil
+local scLast, scPressed, scPressTime, scCtx = nil, false, 0, nil
+local scT = 0
+
+local function scFindAll()
+    scN, scZ, scP, scB = nil, nil, nil, nil
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return end
+    for _, g in ipairs(pg:GetChildren()) do
+        if g ~= gui and g:IsA("ScreenGui") and g.Enabled and scMatch(g.Name, SC_CFG.guiWords) then
+            local needle, zone, perfect, button
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("GuiObject") then
+                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and not button then
+                        button = d
+                    end
+                    if not perfect and scMatch(d.Name, SC_CFG.perfectWords) then
+                        perfect = d
+                    elseif not needle and scMatch(d.Name, SC_CFG.needleWords) then
+                        needle = d
+                    elseif not zone and scMatch(d.Name, SC_CFG.zoneWords) then
+                        zone = d
+                    end
+                end
+            end
+            if needle and (zone or perfect) then
+                scN, scZ, scP, scB = needle, zone, perfect, button
+                return
+            end
+        end
+    end
+end
+
+-- что сейчас делает игрок: generator / heal / trap (по ближайшему объекту)
+local function scContext()
+    local chr = player.Character
+    local root = chr and chr:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local pos = root.Position
+
+    for _, n in ipairs({"Trapped", "InTrap", "Caught", "Stuck"}) do
+        if chr:GetAttribute(n) == true or player:GetAttribute(n) == true then
+            return "trap"
+        end
+    end
+
+    local bestKind, bestDist = nil, math.huge
+    local function consider(kind, dist, range)
+        if dist <= range and dist < bestDist then
+            bestKind, bestDist = kind, dist
+        end
+    end
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and not obj:FindFirstChildOfClass("Humanoid") then
+            local n = string.lower(obj.Name)
+            local kind, range
+            if string.find(n, "generator", 1, true) then
+                kind, range = "generator", SC_CFG.genRange
+            elseif string.find(n, "trap", 1, true) then
+                kind, range = "trap", SC_CFG.trapRange
+            end
+            if kind then
+                local ok, cf = pcall(function() return obj:GetPivot() end)
+                if ok then consider(kind, (cf.Position - pos).Magnitude, range) end
+            end
+        end
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not espIsKiller(plr) then
+            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if r then consider("heal", (r.Position - pos).Magnitude, SC_CFG.playerRange) end
+        end
+    end
+
+    return bestKind
+end
+
+local function scPress()
+    task.spawn(function()
+        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
+            pcall(function() firesignal(scB.MouseButton1Down) end)
+            pcall(function() firesignal(scB.MouseButton1Click) end)
+            pcall(function() firesignal(scB.Activated) end)
+            return
+        end
+        if VirtualInputManager then
+            pcall(function()
+                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+                task.wait(0.03)
+                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+            end)
+        end
+    end)
+end
+
+local function scActive()
+    return SC.generator or SC.heal or SC.trap
+end
+
+local function scStep(dt)
+    if not scActive() then
+        scLast = nil
+        return
+    end
+
+    scT = scT + dt
+    if (not scN or not scN.Parent) and scT >= 0.2 then
+        scT = 0
+        scFindAll()
+    end
+
+    if not scN or not scN.Parent or not scGuiVisible(scN) then
+        scLast, scPressed, scCtx = nil, false, nil
+        return
+    end
+
+    if scPressed then
+        if os.clock() - scPressTime > 1.2 then
+            scPressed = false
+        end
+        scLast = scNorm(scN.Rotation)
+        return
+    end
+
+    local rot = scNorm(scN.Rotation)
+    if scLast == nil or dt <= 0 then
+        scLast = rot
+        return
+    end
+    local vel = scDiff(rot, scLast) / dt
+    scLast = rot
+    if math.abs(vel) < 20 then return end -- стрелка ещё не движется
+
+    if not scCtx then
+        scCtx = scContext() or "any"
+    end
+    if scCtx ~= "any" and not SC[scCtx] then return end
+
+    local target, tol
+    if SC.perfect and scP and scGuiVisible(scP) then
+        target = scP.Rotation + SC_CFG.perfectOffset
+        tol = SC_CFG.perfectHalfWidth
+    elseif scZ then
+        target = scZ.Rotation + SC_CFG.zoneOffset
+        tol = SC.perfect and SC_CFG.perfectHalfWidth or (SC_CFG.zoneHalfWidth * 0.7)
+    else
+        return
+    end
+
+    local predicted = rot + vel * (SC_CFG.lead + dt)
+    if math.abs(scDiff(predicted, target)) <= tol then
+        scPressed = true
+        scPressTime = os.clock()
+        scPress()
+    end
+end
+
+local function scDump()
+    print("[SC] dump через 3 секунды - запусти скилчек!")
+    task.delay(3, function()
+        local pg = player:FindFirstChild("PlayerGui")
+        if not pg then return end
+        print("---- SC dump ----")
+        for _, g in ipairs(pg:GetChildren()) do
+            if g ~= gui and g:IsA("ScreenGui") and g.Enabled then
+                local matched = scMatch(g.Name, SC_CFG.guiWords)
+                print("ScreenGui:", g.Name, matched and "(match)" or "")
+                if matched then
+                    for _, d in ipairs(g:GetDescendants()) do
+                        if d:IsA("GuiObject") then
+                            print("  ", d:GetFullName(), d.ClassName, "vis:", scGuiVisible(d), "rot:", d.Rotation)
+                        end
+                    end
+                end
+            end
+        end
+        print("context:", scContext())
+        print("---- end ----")
+    end)
+end
+
+---------------------------------------------------------------------
 -- menu window
 ---------------------------------------------------------------------
 local main = new("Frame", {
@@ -1119,13 +1362,27 @@ end
 ---------------------------------------------------------------------
 local opened = true
 
+-- Modal-кнопка освобождает курсор (в том числе в режиме от первого лица)
+local modalBtn = new("TextButton", {
+    Size = UDim2.fromOffset(0, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    Modal = true,
+}, main)
+local prevMouseIcon = UserInputService.MouseIconEnabled
+
 local function setOpen(v)
+    local was = opened
     opened = v
     if v then
+        if not was then prevMouseIcon = UserInputService.MouseIconEnabled end
+        modalBtn.Modal = true
         main.Visible = true
         tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
     else
         closePicker()
+        modalBtn.Modal = false
+        UserInputService.MouseIconEnabled = prevMouseIcon
         tween(scale, {Scale = 0}, 0.2)
         task.delay(0.22, function()
             if not opened then main.Visible = false end
@@ -1259,6 +1516,26 @@ addButton("Сбросить цвета", function()
     saveColors()
 end)
 
+addSection("Auto Skill Check")
+
+addToggle("Generators", false, function(v)
+    SC.generator = v
+end, "scgen")
+
+addToggle("Heal teammates", false, function(v)
+    SC.heal = v
+end, "scheal")
+
+addToggle("Trap release", false, function(v)
+    SC.trap = v
+end, "sctrap")
+
+addToggle("Perfect hit (off = normal)", true, function(v)
+    SC.perfect = v
+end, "scperfect")
+
+addButton("Dump skill check GUI (3s delay, F9)", scDump)
+
 addSection("Settings")
 
 addToggle("Names / distance", true, function(v)
@@ -1310,10 +1587,22 @@ connect(UserInputService.InputEnded, function(input)
     end
 end)
 
-connect(RunService.RenderStepped, function()
+connect(RunService.RenderStepped, function(dt)
     local rot = (os.clock() * 80) % 360
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
+
+    -- пока меню открыто - курсор виден и не заблокирован
+    if opened then
+        if not UserInputService.MouseIconEnabled then
+            UserInputService.MouseIconEnabled = true
+        end
+        if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
+    end
+
+    pcall(scStep, dt)
 end)
 
 ---------------------------------------------------------------------
@@ -1325,6 +1614,11 @@ env.__VDEspCleanup = function()
         if k ~= "names" then ESP[k] = false end
     end
     espClear()
+
+    SC.generator, SC.heal, SC.trap = false, false, false
+    if opened then
+        pcall(function() UserInputService.MouseIconEnabled = prevMouseIcon end)
+    end
 
     for _, c in ipairs(connections) do
         pcall(function() c:Disconnect() end)
