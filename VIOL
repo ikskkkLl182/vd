@@ -1,0 +1,876 @@
+-- Violence District ESP — standalone menu
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
+
+local player = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
+
+if env.__VDEspCleanup then
+    pcall(env.__VDEspCleanup)
+end
+
+local connections = {}
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+local THEME = {
+    bg = Color3.fromRGB(14, 14, 22),
+    panel = Color3.fromRGB(21, 21, 33),
+    item = Color3.fromRGB(30, 30, 46),
+    hover = Color3.fromRGB(44, 44, 66),
+    text = Color3.fromRGB(235, 235, 245),
+    dim = Color3.fromRGB(140, 140, 165),
+    accent = Color3.fromRGB(140, 90, 255),
+    accent2 = Color3.fromRGB(60, 200, 255),
+    off = Color3.fromRGB(58, 58, 80),
+    danger = Color3.fromRGB(255, 80, 100),
+}
+
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    if props then
+        for k, v in pairs(props) do
+            inst[k] = v
+        end
+    end
+    if parent then
+        inst.Parent = parent
+    end
+    return inst
+end
+
+local function corner(obj, radius)
+    return new("UICorner", {CornerRadius = UDim.new(0, radius)}, obj)
+end
+
+local function tween(obj, props, time, style)
+    TweenService:Create(
+        obj,
+        TweenInfo.new(time or 0.25, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        props
+    ):Play()
+end
+
+local layoutCounter = 0
+local function nextOrder()
+    layoutCounter = layoutCounter + 1
+    return layoutCounter
+end
+
+---------------------------------------------------------------------
+-- keybinds (saved to a file if the executor supports it)
+---------------------------------------------------------------------
+local SAVE_FILE = "vd_esp_binds.json"
+local savedBinds = {}
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(SAVE_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(SAVE_FILE))
+            if type(decoded) == "table" then
+                savedBinds = decoded
+            end
+        end
+    end)
+end
+
+local binds = {}
+local bindActions = {}
+local bindRefresh = {}
+local listeningId = nil
+
+local function saveBinds()
+    if not writefile then return end
+    local data = {}
+    for id, key in pairs(binds) do
+        data[id] = key and key.Name or ""
+    end
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+local function keyText(key)
+    if not key then return "None" end
+    local n = key.Name
+    n = string.gsub(n, "Control", "Ctrl")
+    n = string.gsub(n, "^Left", "L")
+    n = string.gsub(n, "^Right", "R")
+    return n
+end
+
+local function registerBind(id, defaultKey, action)
+    local resolved = defaultKey or false
+    local saved = savedBinds[id]
+    if type(saved) == "string" then
+        if saved == "" then
+            resolved = false
+        else
+            local ok, key = pcall(function() return Enum.KeyCode[saved] end)
+            if ok and key then resolved = key end
+        end
+    end
+    binds[id] = resolved
+    bindActions[id] = action
+end
+
+local function makeBindButton(parent, id, position)
+    local btn = new("TextButton", {
+        Size = UDim2.fromOffset(72, 24),
+        Position = position,
+        BackgroundColor3 = THEME.bg,
+        AutoButtonColor = false,
+        Text = keyText(binds[id]),
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = THEME.accent2,
+    }, parent)
+    corner(btn, 6)
+    local st = new("UIStroke", {
+        Thickness = 1,
+        Color = THEME.off,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, btn)
+
+    local function refresh()
+        local listening = listeningId == id
+        btn.Text = listening and "..." or keyText(binds[id])
+        btn.TextColor3 = listening and THEME.text or (binds[id] and THEME.accent2 or THEME.dim)
+        tween(st, {Color = listening and THEME.accent or THEME.off}, 0.15)
+    end
+
+    bindRefresh[id] = refresh
+
+    connect(btn.Activated, function()
+        local prev = listeningId
+        if listeningId == id then
+            listeningId = nil
+        else
+            listeningId = id
+        end
+        if prev and bindRefresh[prev] then bindRefresh[prev]() end
+        refresh()
+    end)
+
+    refresh()
+end
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if listeningId then
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local id = listeningId
+        listeningId = nil
+        if input.KeyCode == Enum.KeyCode.Escape then
+        elseif input.KeyCode == Enum.KeyCode.Backspace then
+            binds[id] = false
+        else
+            for otherId, key in pairs(binds) do
+                if otherId ~= id and key == input.KeyCode then
+                    binds[otherId] = false
+                    if bindRefresh[otherId] then bindRefresh[otherId]() end
+                end
+            end
+            binds[id] = input.KeyCode
+        end
+        if bindRefresh[id] then bindRefresh[id]() end
+        saveBinds()
+        return
+    end
+
+    if processed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    for id, key in pairs(binds) do
+        if key and key == input.KeyCode then
+            local action = bindActions[id]
+            if action then pcall(action) end
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- gui root
+---------------------------------------------------------------------
+local gui = new("ScreenGui", {
+    Name = "VDEspMenu",
+    ResetOnSpawn = false,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+local function mount()
+    local targets = {
+        function() return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5) end,
+        function() return gethui and gethui() end,
+        function() return game:GetService("CoreGui") end,
+    }
+    for _, get in ipairs(targets) do
+        local ok, parent = pcall(get)
+        if ok and parent then
+            local ok2 = pcall(function() gui.Parent = parent end)
+            if ok2 and gui.Parent then return end
+        end
+    end
+end
+mount()
+
+---------------------------------------------------------------------
+-- ESP
+---------------------------------------------------------------------
+local espFolder = new("Folder", {Name = "ESP"}, gui)
+
+local ESP = {
+    survivors = false,
+    killer = false,
+    generators = false,
+    hooks = false,
+    gates = false,
+    pallets = false,
+    windows = false,
+    names = true,
+}
+
+-- object categories: Model names that contain one of the words (lowercase).
+-- If an object is not highlighted, press "Dump map info", look at the real
+-- names in the console (F9) and add them to the matching "words" list.
+local ESP_CATS = {
+    generators = {words = {"generator"}, color = Color3.fromRGB(255, 220, 60), label = "Generator"},
+    hooks = {words = {"hook"}, color = Color3.fromRGB(255, 90, 90), label = "Hook"},
+    gates = {words = {"gate", "exit"}, color = Color3.fromRGB(90, 255, 130), label = "Gate"},
+    pallets = {words = {"pallet"}, color = Color3.fromRGB(255, 160, 60), label = "Pallet"},
+    windows = {words = {"window"}, color = Color3.fromRGB(120, 200, 255), label = "Window"},
+}
+
+local ESP_SURVIVOR_COLOR = Color3.fromRGB(80, 255, 130)
+local ESP_KILLER_COLOR = Color3.fromRGB(255, 60, 60)
+
+local espItems = {}
+
+local function espRemove(key)
+    local it = espItems[key]
+    if not it then return end
+    espItems[key] = nil
+    pcall(function() if it.hl then it.hl:Destroy() end end)
+    pcall(function() it.bb:Destroy() end)
+end
+
+local function espClear(filter)
+    for key, it in pairs(espItems) do
+        if not filter or filter(it) then
+            espRemove(key)
+        end
+    end
+end
+
+local function espMakeTag(part, color)
+    local bb = new("BillboardGui", {
+        Adornee = part,
+        AlwaysOnTop = true,
+        Size = UDim2.fromOffset(150, 22),
+        StudsOffset = Vector3.new(0, 3, 0),
+        LightInfluence = 0,
+        ResetOnSpawn = false,
+    }, espFolder)
+    local lbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = color,
+        TextStrokeTransparency = 0.3,
+        Text = "",
+    }, bb)
+    return bb, lbl
+end
+
+-- who is the killer: team name, attributes, or a "Killer" object in the character
+local function espIsKiller(plr)
+    local team = plr.Team
+    if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
+
+    local function check(inst)
+        for _, name in ipairs({"Killer", "IsKiller", "killer", "Role", "role", "Team", "team"}) do
+            local v = inst:GetAttribute(name)
+            if v == true and string.find(string.lower(name), "kill", 1, true) then return true end
+            if type(v) == "string" and string.find(string.lower(v), "kill", 1, true) then return true end
+        end
+        return false
+    end
+
+    if check(plr) then return true end
+    local chr = plr.Character
+    if chr then
+        if check(chr) then return true end
+        if chr:FindFirstChild("Killer") then return true end
+    end
+    return false
+end
+
+local function espRefreshPlayers()
+    local alive = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player then
+            local killer = espIsKiller(plr)
+            local want = (killer and ESP.killer) or ((not killer) and ESP.survivors)
+            local chr = plr.Character
+            local root = chr and chr:FindFirstChild("HumanoidRootPart")
+            local hum = chr and chr:FindFirstChildOfClass("Humanoid")
+            if want and chr and root and (not hum or hum.Health > 0) then
+                alive[plr] = true
+                local color = killer and ESP_KILLER_COLOR or ESP_SURVIVOR_COLOR
+                local it = espItems[plr]
+                if it and (it.chr ~= chr or it.killer ~= killer) then
+                    espRemove(plr)
+                    it = nil
+                end
+                if not it then
+                    local hl = new("Highlight", {
+                        Adornee = chr,
+                        FillColor = color,
+                        OutlineColor = color,
+                        FillTransparency = 0.65,
+                        OutlineTransparency = 0,
+                        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                    }, espFolder)
+                    local bb, lbl = espMakeTag(root, color)
+                    espItems[plr] = {
+                        kind = "player",
+                        chr = chr,
+                        killer = killer,
+                        part = root,
+                        hl = hl,
+                        bb = bb,
+                        lbl = lbl,
+                        text = plr.DisplayName .. (killer and " (KILLER)" or ""),
+                    }
+                end
+            end
+        end
+    end
+    for key, it in pairs(espItems) do
+        if it.kind == "player" and not alive[key] then
+            espRemove(key)
+        end
+    end
+end
+
+local function espNameHas(inst, cat)
+    local n = string.lower(inst.Name)
+    for _, w in ipairs(ESP_CATS[cat].words) do
+        if string.find(n, w, 1, true) then return true end
+    end
+    return false
+end
+
+local function espConsider(obj)
+    if not obj:IsA("Model") or espItems[obj] then return end
+    if obj:FindFirstChildOfClass("Humanoid") then return end
+    for cat, def in pairs(ESP_CATS) do
+        if ESP[cat] and espNameHas(obj, cat) then
+            local p = obj.Parent
+            while p and p ~= workspace do
+                if p:IsA("Model") and espNameHas(p, cat) then return end
+                p = p.Parent
+            end
+            local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
+            if not part then return end
+            local bb, lbl = espMakeTag(part, def.color)
+            espItems[obj] = {kind = "object", cat = cat, target = obj, part = part, bb = bb, lbl = lbl, text = def.label}
+            return
+        end
+    end
+end
+
+local function espScan()
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") then espConsider(obj) end
+    end
+end
+
+local function espAnyObject()
+    for cat in pairs(ESP_CATS) do
+        if ESP[cat] then return true end
+    end
+    return false
+end
+
+local function espSet(flag, v)
+    ESP[flag] = v
+    if flag == "survivors" or flag == "killer" then
+        espRefreshPlayers()
+    elseif ESP_CATS[flag] then
+        if v then
+            espScan()
+        else
+            espClear(function(it) return it.cat == flag end)
+        end
+    end
+end
+
+local function espDump()
+    print("---- ESP dump: players ----")
+    for _, plr in ipairs(Players:GetPlayers()) do
+        local attrs = {}
+        for k, v in pairs(plr:GetAttributes()) do
+            table.insert(attrs, k .. "=" .. tostring(v))
+        end
+        print(plr.Name, "| team:", plr.Team and plr.Team.Name or "none", "| killer:", espIsKiller(plr), "|", table.concat(attrs, ", "))
+    end
+    print("---- ESP dump: model names (count) ----")
+    local counts = {}
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and not obj:FindFirstChildOfClass("Humanoid") then
+            counts[obj.Name] = (counts[obj.Name] or 0) + 1
+        end
+    end
+    local names = {}
+    for n, c in pairs(counts) do
+        if c <= 40 then table.insert(names, n) end
+    end
+    table.sort(names)
+    for _, n in ipairs(names) do
+        print(n, counts[n])
+    end
+    print("---- end ----")
+end
+
+connect(workspace.DescendantAdded, function(obj)
+    if not espAnyObject() then return end
+    if obj:IsA("Model") then
+        task.delay(1, function()
+            if obj.Parent then espConsider(obj) end
+        end)
+    end
+end)
+
+local espT1, espT2, espT3 = 0, 0, 0
+connect(RunService.Heartbeat, function(dt)
+    espT1 = espT1 + dt
+    espT2 = espT2 + dt
+    espT3 = espT3 + dt
+
+    if espT1 >= 0.1 then
+        espT1 = 0
+        local cam = workspace.CurrentCamera
+        if cam then
+            local cp = cam.CFrame.Position
+            for _, it in pairs(espItems) do
+                local part = it.part
+                if part and part.Parent then
+                    if ESP.names then
+                        it.lbl.Text = string.format("%s [%d]", it.text, math.floor((cp - part.Position).Magnitude))
+                    else
+                        it.lbl.Text = ""
+                    end
+                end
+            end
+        end
+    end
+
+    if espT2 >= 0.5 then
+        espT2 = 0
+        if ESP.survivors or ESP.killer then espRefreshPlayers() end
+        for key, it in pairs(espItems) do
+            if it.kind == "object" and not it.target:IsDescendantOf(workspace) then
+                espRemove(key)
+            end
+        end
+    end
+
+    if espT3 >= 10 then
+        espT3 = 0
+        if espAnyObject() then espScan() end
+    end
+end)
+
+---------------------------------------------------------------------
+-- menu window
+---------------------------------------------------------------------
+local main = new("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(380, 470),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.bg,
+    BorderSizePixel = 0,
+    Active = true,
+}, gui)
+corner(main, 14)
+new("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(28, 20, 48), THEME.bg),
+    Rotation = 60,
+}, main)
+
+local scale = new("UIScale", {Scale = 0}, main)
+
+local mainStroke = new("UIStroke", {
+    Thickness = 2,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    Color = Color3.new(1, 1, 1),
+}, main)
+local strokeGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, mainStroke)
+
+local topbar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+    Active = true,
+}, main)
+
+local title = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(18, 0),
+    Size = UDim2.fromOffset(60, 44),
+    Font = Enum.Font.GothamBlack,
+    TextSize = 20,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = Color3.new(1, 1, 1),
+    Text = "ESP",
+}, topbar)
+new("UIGradient", {Color = ColorSequence.new(THEME.accent, THEME.accent2)}, title)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(66, 3),
+    Size = UDim2.fromOffset(220, 44),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "Violence District  |  custom keybinds",
+}, topbar)
+
+local closeBtn = new("TextButton", {
+    Size = UDim2.fromOffset(28, 28),
+    Position = UDim2.new(1, -42, 0, 8),
+    BackgroundColor3 = THEME.item,
+    AutoButtonColor = false,
+    Text = "X",
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = THEME.dim,
+}, topbar)
+corner(closeBtn, 8)
+
+connect(closeBtn.MouseEnter, function()
+    tween(closeBtn, {BackgroundColor3 = THEME.danger, TextColor3 = Color3.new(1, 1, 1)}, 0.15)
+end)
+connect(closeBtn.MouseLeave, function()
+    tween(closeBtn, {BackgroundColor3 = THEME.item, TextColor3 = THEME.dim}, 0.15)
+end)
+
+local topLine = new("Frame", {
+    Position = UDim2.fromOffset(10, 44),
+    Size = UDim2.new(1, -20, 0, 2),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, main)
+corner(topLine, 1)
+new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, topLine)
+
+local page = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(10, 56),
+    Size = UDim2.new(1, -20, 1, -86),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = THEME.accent,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, main)
+new("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, page)
+new("UIPadding", {
+    PaddingRight = UDim.new(0, 6),
+    PaddingTop = UDim.new(0, 2),
+    PaddingBottom = UDim.new(0, 6),
+}, page)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 14, 1, -26),
+    Size = UDim2.new(1, -28, 0, 20),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "Click a key box to rebind  |  Backspace clears  |  Esc cancels",
+}, main)
+
+local function addSection(text)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.dim,
+        Text = string.upper(text),
+        LayoutOrder = nextOrder(),
+    }, page)
+end
+
+local function addToggle(text, default, callback, bindId, defaultKey)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, bindId and -158 or -80, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local track = new("Frame", {
+        Size = UDim2.fromOffset(44, 22),
+        Position = UDim2.new(1, -58, 0.5, -11),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 11)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(16, 16),
+        Position = UDim2.fromOffset(3, 3),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 8)
+
+    local click = new("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, row)
+
+    local state = default and true or false
+    local obj = {}
+
+    local function render()
+        tween(track, {BackgroundColor3 = state and THEME.accent or THEME.off}, 0.2)
+        tween(knob, {Position = state and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)}, 0.2, Enum.EasingStyle.Back)
+    end
+
+    function obj.set(v)
+        state = v and true or false
+        render()
+        pcall(callback, state)
+    end
+
+    function obj.get()
+        return state
+    end
+
+    connect(click.Activated, function()
+        obj.set(not state)
+    end)
+
+    if bindId then
+        registerBind(bindId, defaultKey, function()
+            obj.set(not state)
+        end)
+        makeBindButton(row, bindId, UDim2.new(1, -136, 0.5, -12))
+    end
+
+    render()
+    return obj
+end
+
+local function addBindRow(text, id, defaultKey, action)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -100, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+    registerBind(id, defaultKey, action)
+    makeBindButton(row, id, UDim2.new(1, -86, 0.5, -12))
+end
+
+local function addButton(text, callback)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 38),
+        BackgroundColor3 = THEME.item,
+        AutoButtonColor = false,
+        Text = text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextColor3 = THEME.text,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(btn, 8)
+
+    connect(btn.MouseEnter, function()
+        tween(btn, {BackgroundColor3 = THEME.hover}, 0.15)
+    end)
+    connect(btn.MouseLeave, function()
+        tween(btn, {BackgroundColor3 = THEME.item}, 0.15)
+    end)
+    connect(btn.Activated, function()
+        btn.BackgroundColor3 = THEME.accent
+        tween(btn, {BackgroundColor3 = THEME.hover}, 0.3)
+        pcall(callback)
+    end)
+end
+
+local opened = true
+
+local function setOpen(v)
+    opened = v
+    if v then
+        main.Visible = true
+        tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
+    else
+        tween(scale, {Scale = 0}, 0.2)
+        task.delay(0.22, function()
+            if not opened then main.Visible = false end
+        end)
+    end
+end
+
+---------------------------------------------------------------------
+-- menu content
+---------------------------------------------------------------------
+addSection("Players")
+
+addToggle("Survivors", false, function(v)
+    espSet("survivors", v)
+end, "espsurv")
+
+addToggle("Killer", false, function(v)
+    espSet("killer", v)
+end, "espkiller")
+
+addSection("Objects")
+
+addToggle("Generators", false, function(v)
+    espSet("generators", v)
+end, "espgen")
+
+addToggle("Hooks", false, function(v)
+    espSet("hooks", v)
+end, "esphook")
+
+addToggle("Gates / Exits", false, function(v)
+    espSet("gates", v)
+end, "espgate")
+
+addToggle("Pallets", false, function(v)
+    espSet("pallets", v)
+end, "esppallet")
+
+addToggle("Windows", false, function(v)
+    espSet("windows", v)
+end, "espwindow")
+
+addSection("Settings")
+
+addToggle("Names / distance", true, function(v)
+    ESP.names = v
+end, "espnames")
+
+addBindRow("Menu key", "menu", Enum.KeyCode.RightShift, function()
+    setOpen(not opened)
+end)
+
+addButton("Dump map info (console F9)", espDump)
+
+addButton("Unload ESP", function()
+    if env.__VDEspCleanup then env.__VDEspCleanup() end
+end)
+
+connect(closeBtn.Activated, function()
+    setOpen(false)
+end)
+
+tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
+
+---------------------------------------------------------------------
+-- dragging
+---------------------------------------------------------------------
+local dragging, dragStart, startPos = false, nil, nil
+
+connect(topbar.InputBegan, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = false
+    end
+end)
+
+connect(RunService.RenderStepped, function()
+    strokeGrad.Rotation = (os.clock() * 80) % 360
+end)
+
+---------------------------------------------------------------------
+-- unload
+---------------------------------------------------------------------
+env.__VDEspCleanup = function()
+    for k in pairs(ESP) do
+        if k ~= "names" then ESP[k] = false end
+    end
+    espClear()
+
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    gui:Destroy()
+    env.__VDEspCleanup = nil
+end
