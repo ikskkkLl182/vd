@@ -301,12 +301,15 @@ local ESP = {
 -- object categories: Model names that contain one of the words (lowercase).
 -- If an object is not highlighted, press "Dump map info", look at the real
 -- names in the console (F9) and add them to the matching "words" list.
+-- names  - точные имена (lowercase), words - подстроки в имени,
+-- anchor - имя части внутри объекта, к которой цепляется метка,
+-- highlight - подсвечивать контуром (у Roblox лимит ~31 Highlight, поэтому не всем).
 local ESP_CATS = {
-    generators = {words = {"generator"}, label = "Generator"},
-    hooks = {words = {"hook"}, label = "Hook"},
-    gates = {words = {"gate", "exit"}, label = "Gate"},
-    pallets = {words = {"pallet"}, label = "Pallet"},
-    windows = {words = {"window"}, label = "Window"},
+    generators = {names = {"generator"}, anchor = "HitBox", label = "Generator", highlight = true},
+    hooks = {names = {"hook"}, anchor = "HookPoint", label = "Hook", highlight = true},
+    gates = {words = {"gate", "exit"}, label = "Gate", highlight = true},
+    pallets = {names = {"palletwrong", "palletalien", "pallet"}, anchor = "HumanoidRootPart", label = "Pallet"},
+    windows = {names = {"window"}, anchor = "inviswall", label = "Window"},
 }
 
 local espItems = {}
@@ -393,7 +396,7 @@ end
 local function espRefreshPlayers()
     local alive = {}
     for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player then
+        if plr ~= player and not string.find(plr.Team and string.lower(plr.Team.Name) or "", "spect", 1, true) then
             local killer = espIsKiller(plr)
             local want = (killer and ESP.killer) or ((not killer) and ESP.survivors)
             local chr = plr.Character
@@ -439,35 +442,77 @@ local function espRefreshPlayers()
 end
 
 local function espNameHas(inst, cat)
+    local def = ESP_CATS[cat]
     local n = string.lower(inst.Name)
-    for _, w in ipairs(ESP_CATS[cat].words) do
-        if string.find(n, w, 1, true) then return true end
+    if def.names then
+        for _, w in ipairs(def.names) do
+            if n == w then return true end
+        end
+    end
+    if def.words then
+        for _, w in ipairs(def.words) do
+            if string.find(n, w, 1, true) then return true end
+        end
     end
     return false
 end
 
 local function espConsider(obj)
-    if not obj:IsA("Model") or espItems[obj] then return end
+    if espItems[obj] then return end
+    if not (obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder")) then return end
     if obj:FindFirstChildOfClass("Humanoid") then return end
     for cat, def in pairs(ESP_CATS) do
         if ESP[cat] and espNameHas(obj, cat) then
-            local p = obj.Parent
-            while p and p ~= workspace do
-                if p:IsA("Model") and espNameHas(p, cat) then return end
-                p = p.Parent
+            local part = def.anchor and obj:FindFirstChild(def.anchor)
+            if not (part and part:IsA("BasePart")) then
+                -- нет якорной части: пропускаем, если выше есть такой же объект (вложенные детали)
+                local p = obj.Parent
+                while p and p ~= workspace do
+                    if espNameHas(p, cat) then return end
+                    p = p.Parent
+                end
+                part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
             end
-            local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
             if not part then return end
-            local bb, lbl = espMakeTag(part, ESPColors[cat])
-            espItems[obj] = {kind = "object", cat = cat, target = obj, part = part, bb = bb, lbl = lbl, text = def.label}
+
+            local color = ESPColors[cat]
+            local hl = nil
+            if def.highlight and obj:IsA("PVInstance") then
+                hl = new("Highlight", {
+                    Adornee = obj,
+                    FillColor = color,
+                    OutlineColor = color,
+                    FillTransparency = 0.75,
+                    OutlineTransparency = 0,
+                    DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                }, espFolder)
+            end
+            local bb, lbl = espMakeTag(part, color)
+            local extra = nil
+            if cat == "generators" then
+                extra = function()
+                    local pr = obj:GetAttribute("RepairProgress")
+                    if type(pr) == "number" then
+                        return string.format("Generator %d%%", math.floor(pr + 0.5))
+                    end
+                    return "Generator"
+                end
+            end
+            espItems[obj] = {
+                kind = "object", cat = cat, target = obj, part = part,
+                hl = hl, bb = bb, lbl = lbl, text = def.label, extra = extra,
+            }
             return
         end
     end
 end
 
 local function espScan()
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") then espConsider(obj) end
+    local root = workspace:FindFirstChild("Map") or workspace
+    for _, obj in ipairs(root:GetDescendants()) do
+        if obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder") then
+            espConsider(obj)
+        end
     end
 end
 
@@ -520,10 +565,19 @@ end
 
 connect(workspace.DescendantAdded, function(obj)
     if not espAnyObject() then return end
-    if obj:IsA("Model") then
-        task.delay(1, function()
-            if obj.Parent then espConsider(obj) end
-        end)
+    if obj:IsA("Model") or obj:IsA("BasePart") or obj:IsA("Folder") then
+        local relevant = false
+        for cat in pairs(ESP_CATS) do
+            if ESP[cat] and espNameHas(obj, cat) then
+                relevant = true
+                break
+            end
+        end
+        if relevant then
+            task.delay(1, function()
+                if obj.Parent then espConsider(obj) end
+            end)
+        end
     end
 end)
 
@@ -542,7 +596,7 @@ connect(RunService.Heartbeat, function(dt)
                 local part = it.part
                 if part and part.Parent then
                     if ESP.names then
-                        it.lbl.Text = string.format("%s [%d]", it.text, math.floor((cp - part.Position).Magnitude))
+                        it.lbl.Text = string.format("%s [%d]", it.extra and it.extra() or it.text, math.floor((cp - part.Position).Magnitude))
                     else
                         it.lbl.Text = ""
                     end
@@ -582,19 +636,23 @@ local SC = {
     perfect = true,    -- true = идеальное попадание (белая зона), false = обычное
 }
 
--- Настройки. Если не попадает / не находит скилчек: нажми
--- "Dump skill check GUI" в меню, запусти скилчек и поправь имена/смещения тут.
+-- Структура скилчека в игре (по открытым скриптам для VD):
+--   PlayerGui.SkillCheckPromptGui.Check.Line  - стрелка
+--   PlayerGui.SkillCheckPromptGui.Check.Goal  - зона
+--   идеальное попадание: Line.Rotation = Goal.Rotation + 104..114
+--   обычное попадание:   Line.Rotation = Goal.Rotation + 115 и дальше
+-- Если промахивается - подкрути perfectCenter / normalCenter (градусы).
 local SC_CFG = {
+    guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
-    needleWords = {"needle", "line", "pointer", "hand", "arrow", "marker"},
-    zoneWords = {"goal", "zone", "success", "target", "good"},
-    perfectWords = {"perfect", "great", "white", "bonus"},
+    needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
+    zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    zoneOffset = 0,        -- смещение угла обычной зоны относительно стрелки (градусы)
-    perfectOffset = 0,     -- смещение угла белой зоны (градусы)
-    zoneHalfWidth = 18,    -- половина ширины обычной зоны (градусы)
-    perfectHalfWidth = 5,  -- допуск для идеального попадания (градусы)
-    lead = 0.03,           -- упреждение в секундах (компенсация задержки)
+    perfectCenter = 109,   -- середина идеальной зоны (104..114)
+    perfectTol = 3.5,      -- допуск для идеального попадания
+    normalCenter = 118,    -- точка обычного попадания (чуть после 115)
+    normalTol = 3,
+    lead = 0.03,           -- упреждение в секундах (задержка нажатия)
     genRange = 12,
     playerRange = 12,
     trapRange = 8,
@@ -627,41 +685,73 @@ local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
 end
 
-local scN, scZ, scP, scB = nil, nil, nil, nil
-local scLast, scPressed, scPressTime, scCtx = nil, false, 0, nil
+local scN, scZ, scB = nil, nil, nil
+local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
 
 local function scFindAll()
-    scN, scZ, scP, scB = nil, nil, nil, nil
+    scN, scZ, scB = nil, nil, nil
     local pg = player:FindFirstChild("PlayerGui")
     if not pg then return end
-    for _, g in ipairs(pg:GetChildren()) do
-        if g ~= gui and g:IsA("ScreenGui") and g.Enabled and scMatch(g.Name, SC_CFG.guiWords) then
-            local needle, zone, perfect, button
+
+    local function grab(g)
+        local check = g:FindFirstChild("Check")
+        local needle = check and check:FindFirstChild("Line")
+        local zone = check and check:FindFirstChild("Goal")
+        if not (needle and zone) then
+            needle, zone = nil, nil
             for _, d in ipairs(g:GetDescendants()) do
                 if d:IsA("GuiObject") then
-                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and not button then
-                        button = d
-                    end
-                    if not perfect and scMatch(d.Name, SC_CFG.perfectWords) then
-                        perfect = d
-                    elseif not needle and scMatch(d.Name, SC_CFG.needleWords) then
+                    if not needle and scMatch(d.Name, SC_CFG.needleWords) then
                         needle = d
                     elseif not zone and scMatch(d.Name, SC_CFG.zoneWords) then
                         zone = d
                     end
                 end
             end
-            if needle and (zone or perfect) then
-                scN, scZ, scP, scB = needle, zone, perfect, button
-                return
+        end
+        if needle and zone then
+            scN, scZ = needle, zone
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextButton") or d:IsA("ImageButton") then
+                    scB = d
+                    break
+                end
             end
+            return true
+        end
+        return false
+    end
+
+    local main = pg:FindFirstChild(SC_CFG.guiName)
+    if main and grab(main) then return end
+    for _, g in ipairs(pg:GetChildren()) do
+        if g ~= gui and g ~= main and g:IsA("ScreenGui") and scMatch(g.Name, SC_CFG.guiWords) then
+            if grab(g) then return end
         end
     end
 end
 
--- что сейчас делает игрок: generator / heal / trap (по ближайшему объекту)
-local function scContext()
+-- точный способ: при скилчеке в персонаже появляется объект "Skillcheck-..."
+local function scCtxFromChar()
+    local chr = player.Character
+    if not chr then return nil end
+    for _, c in ipairs(chr:GetChildren()) do
+        local n = string.lower(c.Name)
+        if string.find(n, "skillcheck", 1, true) then
+            if string.find(n, "gen", 1, true) then return "generator" end
+            if string.find(n, "heal", 1, true) then return "heal" end
+            if string.find(n, "trap", 1, true) or string.find(n, "free", 1, true)
+                or string.find(n, "escape", 1, true) or string.find(n, "bear", 1, true) then
+                return "trap"
+            end
+        end
+    end
+    return nil
+end
+
+-- запасной способ: по ближайшему объекту
+local function scCtxProximity()
     local chr = player.Character
     local root = chr and chr:FindFirstChild("HumanoidRootPart")
     if not root then return nil end
@@ -684,7 +774,7 @@ local function scContext()
         if obj:IsA("Model") and not obj:FindFirstChildOfClass("Humanoid") then
             local n = string.lower(obj.Name)
             local kind, range
-            if string.find(n, "generator", 1, true) then
+            if n == "generator" then
                 kind, range = "generator", SC_CFG.genRange
             elseif string.find(n, "trap", 1, true) then
                 kind, range = "trap", SC_CFG.trapRange
@@ -708,18 +798,26 @@ end
 
 local function scPress()
     task.spawn(function()
-        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
-            pcall(function() firesignal(scB.MouseButton1Down) end)
-            pcall(function() firesignal(scB.MouseButton1Click) end)
-            pcall(function() firesignal(scB.Activated) end)
-            return
+        local fired = false
+        if firesignal then
+            fired = pcall(function()
+                firesignal(UserInputService.InputBegan, {
+                    KeyCode = SC_CFG.key,
+                    UserInputType = Enum.UserInputType.Keyboard,
+                }, false)
+            end)
         end
-        if VirtualInputManager then
+        if not fired and VirtualInputManager then
             pcall(function()
                 VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
                 task.wait(0.03)
                 VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
             end)
+        end
+        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
+            pcall(function() firesignal(scB.MouseButton1Down) end)
+            pcall(function() firesignal(scB.MouseButton1Click) end)
+            pcall(function() firesignal(scB.Activated) end)
         end
     end)
 end
@@ -735,51 +833,55 @@ local function scStep(dt)
     end
 
     scT = scT + dt
-    if (not scN or not scN.Parent) and scT >= 0.2 then
+    local stale = (not scN) or (not scN.Parent)
+    if (stale and scT >= 0.2) or scT >= 2 then
         scT = 0
         scFindAll()
     end
 
-    if not scN or not scN.Parent or not scGuiVisible(scN) then
+    if not scN or not scZ or not scN.Parent or not scGuiVisible(scN) then
         scLast, scPressed, scCtx = nil, false, nil
         return
     end
+
+    local rot = scNorm(scN.Rotation)
 
     if scPressed then
         if os.clock() - scPressTime > 1.2 then
             scPressed = false
         end
-        scLast = scNorm(scN.Rotation)
-        return
-    end
-
-    local rot = scNorm(scN.Rotation)
-    if scLast == nil or dt <= 0 then
         scLast = rot
         return
     end
+
+    if scLast == nil or dt <= 0 then
+        scLast = rot
+        scSeenAt = os.clock()
+        return
+    end
+
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
     if math.abs(vel) < 20 then return end -- стрелка ещё не движется
 
-    if not scCtx then
-        scCtx = scContext() or "any"
+    -- что за скилчек: сначала точно (по персонажу), потом по близости
+    local ctx = scCtxFromChar()
+    if not ctx and scCtx == nil and os.clock() - scSeenAt > 0.25 then
+        scCtx = scCtxProximity() or "any"
     end
-    if scCtx ~= "any" and not SC[scCtx] then return end
+    ctx = ctx or scCtx
+    if not ctx then return end
+    if ctx ~= "any" and not SC[ctx] then return end
 
-    local target, tol
-    if SC.perfect and scP and scGuiVisible(scP) then
-        target = scP.Rotation + SC_CFG.perfectOffset
-        tol = SC_CFG.perfectHalfWidth
-    elseif scZ then
-        target = scZ.Rotation + SC_CFG.zoneOffset
-        tol = SC.perfect and SC_CFG.perfectHalfWidth or (SC_CFG.zoneHalfWidth * 0.7)
-    else
-        return
-    end
+    local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
+    local tol = SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol
+    local target = scZ.Rotation + center
 
-    local predicted = rot + vel * (SC_CFG.lead + dt)
-    if math.abs(scDiff(predicted, target)) <= tol then
+    local diffNow = scDiff(rot, target)
+    local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
+
+    -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
+    if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or math.abs(diffNext) <= tol then
         scPressed = true
         scPressTime = os.clock()
         scPress()
@@ -792,6 +894,14 @@ local function scDump()
         local pg = player:FindFirstChild("PlayerGui")
         if not pg then return end
         print("---- SC dump ----")
+        local chr = player.Character
+        if chr then
+            local names = {}
+            for _, c in ipairs(chr:GetChildren()) do
+                table.insert(names, c.Name)
+            end
+            print("character children:", table.concat(names, ", "))
+        end
         for _, g in ipairs(pg:GetChildren()) do
             if g ~= gui and g:IsA("ScreenGui") and g.Enabled then
                 local matched = scMatch(g.Name, SC_CFG.guiWords)
@@ -805,7 +915,7 @@ local function scDump()
                 end
             end
         end
-        print("context:", scContext())
+        print("context(char):", scCtxFromChar(), "| context(near):", scCtxProximity())
         print("---- end ----")
     end)
 end
