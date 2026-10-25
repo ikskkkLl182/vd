@@ -1,4 +1,5 @@
 -- Violence District ESP — standalone menu
+-- + плавающая иконка (телефон), кнопка K (ПК), выбор цвета ESP
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -57,6 +58,16 @@ local function tween(obj, props, time, style)
     ):Play()
 end
 
+local function isPointer(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMove(input)
+    return input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
 local layoutCounter = 0
 local function nextOrder()
     layoutCounter = layoutCounter + 1
@@ -64,9 +75,9 @@ local function nextOrder()
 end
 
 ---------------------------------------------------------------------
--- keybinds (saved to a file if the executor supports it)
+-- keybinds (сохраняются в файл, если executor поддерживает)
 ---------------------------------------------------------------------
-local SAVE_FILE = "vd_esp_binds.json"
+local SAVE_FILE = "vd_esp_binds_v2.json"
 local savedBinds = {}
 
 if readfile and isfile then
@@ -195,11 +206,63 @@ connect(UserInputService.InputBegan, function(input, processed)
 end)
 
 ---------------------------------------------------------------------
+-- цвета ESP (сохраняются в файл)
+---------------------------------------------------------------------
+local COLOR_FILE = "vd_esp_colors.json"
+
+local DEFAULT_COLORS = {
+    survivors = Color3.fromRGB(80, 255, 130),
+    killer = Color3.fromRGB(255, 60, 60),
+    generators = Color3.fromRGB(255, 220, 60),
+    hooks = Color3.fromRGB(255, 90, 90),
+    gates = Color3.fromRGB(90, 255, 130),
+    pallets = Color3.fromRGB(255, 160, 60),
+    windows = Color3.fromRGB(120, 200, 255),
+}
+
+local ESPColors = {}
+for k, v in pairs(DEFAULT_COLORS) do
+    ESPColors[k] = v
+end
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(COLOR_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(COLOR_FILE))
+            if type(decoded) == "table" then
+                for k, t in pairs(decoded) do
+                    if DEFAULT_COLORS[k] and type(t) == "table" and #t == 3 then
+                        ESPColors[k] = Color3.fromRGB(t[1], t[2], t[3])
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function saveColors()
+    if not writefile then return end
+    local data = {}
+    for k, c in pairs(ESPColors) do
+        data[k] = {
+            math.floor(c.R * 255 + 0.5),
+            math.floor(c.G * 255 + 0.5),
+            math.floor(c.B * 255 + 0.5),
+        }
+    end
+    pcall(function()
+        writefile(COLOR_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+---------------------------------------------------------------------
 -- gui root
 ---------------------------------------------------------------------
 local gui = new("ScreenGui", {
     Name = "VDEspMenu",
     ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
 })
 
@@ -239,15 +302,12 @@ local ESP = {
 -- If an object is not highlighted, press "Dump map info", look at the real
 -- names in the console (F9) and add them to the matching "words" list.
 local ESP_CATS = {
-    generators = {words = {"generator"}, color = Color3.fromRGB(255, 220, 60), label = "Generator"},
-    hooks = {words = {"hook"}, color = Color3.fromRGB(255, 90, 90), label = "Hook"},
-    gates = {words = {"gate", "exit"}, color = Color3.fromRGB(90, 255, 130), label = "Gate"},
-    pallets = {words = {"pallet"}, color = Color3.fromRGB(255, 160, 60), label = "Pallet"},
-    windows = {words = {"window"}, color = Color3.fromRGB(120, 200, 255), label = "Window"},
+    generators = {words = {"generator"}, label = "Generator"},
+    hooks = {words = {"hook"}, label = "Hook"},
+    gates = {words = {"gate", "exit"}, label = "Gate"},
+    pallets = {words = {"pallet"}, label = "Pallet"},
+    windows = {words = {"window"}, label = "Window"},
 }
-
-local ESP_SURVIVOR_COLOR = Color3.fromRGB(80, 255, 130)
-local ESP_KILLER_COLOR = Color3.fromRGB(255, 60, 60)
 
 local espItems = {}
 
@@ -288,6 +348,25 @@ local function espMakeTag(part, color)
     return bb, lbl
 end
 
+-- применить текущие цвета ко всем уже созданным объектам ESP
+local function espApplyColors()
+    for _, it in pairs(espItems) do
+        local c
+        if it.kind == "player" then
+            c = it.killer and ESPColors.killer or ESPColors.survivors
+        else
+            c = ESPColors[it.cat]
+        end
+        if c then
+            if it.hl then
+                it.hl.FillColor = c
+                it.hl.OutlineColor = c
+            end
+            it.lbl.TextColor3 = c
+        end
+    end
+end
+
 -- who is the killer: team name, attributes, or a "Killer" object in the character
 local function espIsKiller(plr)
     local team = plr.Team
@@ -322,7 +401,7 @@ local function espRefreshPlayers()
             local hum = chr and chr:FindFirstChildOfClass("Humanoid")
             if want and chr and root and (not hum or hum.Health > 0) then
                 alive[plr] = true
-                local color = killer and ESP_KILLER_COLOR or ESP_SURVIVOR_COLOR
+                local color = killer and ESPColors.killer or ESPColors.survivors
                 local it = espItems[plr]
                 if it and (it.chr ~= chr or it.killer ~= killer) then
                     espRemove(plr)
@@ -379,7 +458,7 @@ local function espConsider(obj)
             end
             local part = obj.PrimaryPart or obj:FindFirstChildWhichIsA("BasePart", true)
             if not part then return end
-            local bb, lbl = espMakeTag(part, def.color)
+            local bb, lbl = espMakeTag(part, ESPColors[cat])
             espItems[obj] = {kind = "object", cat = cat, target = obj, part = part, bb = bb, lbl = lbl, text = def.label}
             return
         end
@@ -547,7 +626,7 @@ new("TextLabel", {
     TextSize = 12,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
-    Text = "Violence District  |  custom keybinds",
+    Text = "Violence District  |  K - меню",
 }, topbar)
 
 local closeBtn = new("TextButton", {
@@ -612,7 +691,7 @@ new("TextLabel", {
     TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
-    Text = "Click a key box to rebind  |  Backspace clears  |  Esc cancels",
+    Text = "Клик по кнопке клавиши - сменить  |  Backspace - убрать  |  Esc - отмена",
 }, main)
 
 local function addSection(text)
@@ -751,6 +830,293 @@ local function addButton(text, callback)
     end)
 end
 
+---------------------------------------------------------------------
+-- выбор цвета (попап с HSV-слайдерами)
+---------------------------------------------------------------------
+local colorSwatches = {}
+
+local picker = new("Frame", {
+    Name = "ColorPicker",
+    Size = UDim2.fromOffset(330, 300),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.panel,
+    BorderSizePixel = 0,
+    Visible = false,
+    Active = true,
+    ZIndex = 10,
+}, main)
+corner(picker, 12)
+new("UIStroke", {
+    Thickness = 2,
+    Color = THEME.accent,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, picker)
+
+local pickerTitle = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 10),
+    Size = UDim2.new(1, -90, 0, 22),
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.text,
+    Text = "Цвет",
+}, picker)
+
+local preview = new("Frame", {
+    Position = UDim2.new(1, -60, 0, 10),
+    Size = UDim2.fromOffset(44, 22),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, picker)
+corner(preview, 6)
+
+local function makeSlider(parent, y, labelText, onChange)
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(16, y),
+        Size = UDim2.fromOffset(20, 20),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = THEME.dim,
+        Text = labelText,
+    }, parent)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(40, y + 4),
+        Size = UDim2.new(1, -62, 0, 12),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Active = true,
+    }, parent)
+    corner(track, 6)
+    local grad = new("UIGradient", nil, track)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(10, 20),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 4)
+    new("UIStroke", {Thickness = 1.5, Color = Color3.new(0, 0, 0)}, knob)
+
+    local s = {grad = grad}
+    local dragging = false
+
+    function s.set(v)
+        knob.Position = UDim2.fromScale(math.clamp(v, 0, 1), 0.5)
+    end
+
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local v = math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+        s.set(v)
+        onChange(v)
+    end
+
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            dragging = true
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if isPointer(input) then
+            dragging = false
+        end
+    end)
+
+    return s
+end
+
+local pickKey = nil
+local hsv = {0, 1, 1}
+local hueS, satS, valS
+
+local rgbLabel = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 142),
+    Size = UDim2.new(1, -32, 0, 18),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "",
+}, picker)
+
+local function pickerRender()
+    local h, s, v = hsv[1], hsv[2], hsv[3]
+    local c = Color3.fromHSV(h, s, v)
+    preview.BackgroundColor3 = c
+    satS.grad.Color = ColorSequence.new(Color3.fromHSV(h, 0, v), Color3.fromHSV(h, 1, v))
+    valS.grad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(h, s, 1))
+    rgbLabel.Text = string.format(
+        "RGB: %d, %d, %d",
+        math.floor(c.R * 255 + 0.5),
+        math.floor(c.G * 255 + 0.5),
+        math.floor(c.B * 255 + 0.5)
+    )
+end
+
+local function pickerApply()
+    if not pickKey then return end
+    local c = Color3.fromHSV(hsv[1], hsv[2], hsv[3])
+    ESPColors[pickKey] = c
+    if colorSwatches[pickKey] then
+        colorSwatches[pickKey].BackgroundColor3 = c
+    end
+    espApplyColors()
+    pickerRender()
+end
+
+local rainbowKeys = {}
+for i = 0, 6 do
+    table.insert(rainbowKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(math.min(i / 6, 0.999), 1, 1)))
+end
+
+hueS = makeSlider(picker, 48, "H", function(v)
+    hsv[1] = v
+    pickerApply()
+end)
+hueS.grad.Color = ColorSequence.new(rainbowKeys)
+
+satS = makeSlider(picker, 80, "S", function(v)
+    hsv[2] = v
+    pickerApply()
+end)
+
+valS = makeSlider(picker, 112, "V", function(v)
+    hsv[3] = v
+    pickerApply()
+end)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 168),
+    Size = UDim2.fromOffset(100, 16),
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "ГОТОВЫЕ ЦВЕТА",
+}, picker)
+
+local PRESETS = {
+    Color3.fromRGB(255, 60, 60),
+    Color3.fromRGB(255, 160, 60),
+    Color3.fromRGB(255, 220, 60),
+    Color3.fromRGB(80, 255, 130),
+    Color3.fromRGB(60, 200, 255),
+    Color3.fromRGB(140, 90, 255),
+    Color3.fromRGB(255, 100, 220),
+    Color3.fromRGB(255, 255, 255),
+}
+
+local function pickerLoad(color)
+    local h, s, v = color:ToHSV()
+    hsv = {h, s, v}
+    hueS.set(h)
+    satS.set(s)
+    valS.set(v)
+end
+
+for i, col in ipairs(PRESETS) do
+    local b = new("TextButton", {
+        Position = UDim2.fromOffset(16 + (i - 1) * 38, 190),
+        Size = UDim2.fromOffset(30, 30),
+        BackgroundColor3 = col,
+        AutoButtonColor = false,
+        Text = "",
+    }, picker)
+    corner(b, 8)
+    connect(b.Activated, function()
+        pickerLoad(col)
+        pickerApply()
+    end)
+end
+
+local function closePicker()
+    if picker.Visible then
+        picker.Visible = false
+        saveColors()
+    end
+    pickKey = nil
+end
+
+local doneBtn = new("TextButton", {
+    Position = UDim2.fromOffset(16, 244),
+    Size = UDim2.new(1, -32, 0, 38),
+    BackgroundColor3 = THEME.accent,
+    AutoButtonColor = false,
+    Text = "Готово",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = Color3.new(1, 1, 1),
+}, picker)
+corner(doneBtn, 8)
+connect(doneBtn.Activated, closePicker)
+
+local function openPicker(key, label)
+    pickKey = key
+    pickerTitle.Text = "Цвет: " .. label
+    pickerLoad(ESPColors[key])
+    pickerRender()
+    picker.Visible = true
+end
+
+local function addColorRow(text, key)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -80, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local sw = new("TextButton", {
+        Size = UDim2.fromOffset(44, 22),
+        Position = UDim2.new(1, -58, 0.5, -11),
+        BackgroundColor3 = ESPColors[key],
+        AutoButtonColor = false,
+        Text = "",
+    }, row)
+    corner(sw, 6)
+    new("UIStroke", {
+        Thickness = 1,
+        Color = THEME.text,
+        Transparency = 0.6,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, sw)
+
+    colorSwatches[key] = sw
+    connect(sw.Activated, function()
+        openPicker(key, text)
+    end)
+end
+
+---------------------------------------------------------------------
+-- открыть / закрыть меню
+---------------------------------------------------------------------
 local opened = true
 
 local function setOpen(v)
@@ -759,12 +1125,83 @@ local function setOpen(v)
         main.Visible = true
         tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
     else
+        closePicker()
         tween(scale, {Scale = 0}, 0.2)
         task.delay(0.22, function()
             if not opened then main.Visible = false end
         end)
     end
 end
+
+---------------------------------------------------------------------
+-- плавающая иконка (для телефона, работает и на ПК)
+---------------------------------------------------------------------
+local cam0 = workspace.CurrentCamera
+local vp0 = cam0 and cam0.ViewportSize or Vector2.new(800, 600)
+
+local icon = new("TextButton", {
+    Name = "ToggleIcon",
+    Size = UDim2.fromOffset(50, 50),
+    Position = UDim2.fromOffset(16, math.floor(vp0.Y * 0.35)),
+    BackgroundColor3 = THEME.bg,
+    AutoButtonColor = false,
+    Text = "ESP",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 15,
+    TextColor3 = Color3.new(1, 1, 1),
+    ZIndex = 20,
+}, gui)
+corner(icon, 25)
+local iconStroke = new("UIStroke", {
+    Thickness = 2.5,
+    Color = Color3.new(1, 1, 1),
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, icon)
+local iconGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, iconStroke)
+
+local iconDown, iconMoved = false, false
+local iconStartIn, iconStartPos = nil, nil
+
+connect(icon.InputBegan, function(input)
+    if isPointer(input) then
+        iconDown = true
+        iconMoved = false
+        iconStartIn = input.Position
+        iconStartPos = icon.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if iconDown and isMove(input) then
+        local d = input.Position - iconStartIn
+        if d.Magnitude > 6 then
+            iconMoved = true
+        end
+        if iconMoved then
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+            local size = icon.AbsoluteSize
+            local x = math.clamp(iconStartPos.X.Offset + d.X, 0, vp.X - size.X)
+            local y = math.clamp(iconStartPos.Y.Offset + d.Y, 0, vp.Y - size.Y)
+            icon.Position = UDim2.fromOffset(x, y)
+        end
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if iconDown and isPointer(input) then
+        iconDown = false
+        if not iconMoved then
+            setOpen(not opened)
+        end
+    end
+end)
 
 ---------------------------------------------------------------------
 -- menu content
@@ -801,13 +1238,34 @@ addToggle("Windows", false, function(v)
     espSet("windows", v)
 end, "espwindow")
 
+addSection("Colors")
+
+addColorRow("Survivors", "survivors")
+addColorRow("Killer", "killer")
+addColorRow("Generators", "generators")
+addColorRow("Hooks", "hooks")
+addColorRow("Gates / Exits", "gates")
+addColorRow("Pallets", "pallets")
+addColorRow("Windows", "windows")
+
+addButton("Сбросить цвета", function()
+    for k, v in pairs(DEFAULT_COLORS) do
+        ESPColors[k] = v
+        if colorSwatches[k] then
+            colorSwatches[k].BackgroundColor3 = v
+        end
+    end
+    espApplyColors()
+    saveColors()
+end)
+
 addSection("Settings")
 
 addToggle("Names / distance", true, function(v)
     ESP.names = v
 end, "espnames")
 
-addBindRow("Menu key", "menu", Enum.KeyCode.RightShift, function()
+addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
     setOpen(not opened)
 end)
 
@@ -824,13 +1282,12 @@ end)
 tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
--- dragging
+-- dragging (окно меню)
 ---------------------------------------------------------------------
 local dragging, dragStart, startPos = false, nil, nil
 
 connect(topbar.InputBegan, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+    if isPointer(input) then
         dragging = true
         dragStart = input.Position
         startPos = main.Position
@@ -838,8 +1295,7 @@ connect(topbar.InputBegan, function(input)
 end)
 
 connect(UserInputService.InputChanged, function(input)
-    if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement
-        or input.UserInputType == Enum.UserInputType.Touch) then
+    if dragging and isMove(input) then
         local d = input.Position - dragStart
         main.Position = UDim2.new(
             startPos.X.Scale, startPos.X.Offset + d.X,
@@ -849,20 +1305,22 @@ connect(UserInputService.InputChanged, function(input)
 end)
 
 connect(UserInputService.InputEnded, function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1
-        or input.UserInputType == Enum.UserInputType.Touch then
+    if isPointer(input) then
         dragging = false
     end
 end)
 
 connect(RunService.RenderStepped, function()
-    strokeGrad.Rotation = (os.clock() * 80) % 360
+    local rot = (os.clock() * 80) % 360
+    strokeGrad.Rotation = rot
+    iconGrad.Rotation = rot
 end)
 
 ---------------------------------------------------------------------
 -- unload
 ---------------------------------------------------------------------
 env.__VDEspCleanup = function()
+    saveColors()
     for k in pairs(ESP) do
         if k ~= "names" then ESP[k] = false end
     end
