@@ -507,9 +507,11 @@ local SC_CFG = {
     key = Enum.KeyCode.Space,
     perfectCenter = 111,   -- точка нажатия в идеальной зоне (104..114); не доводит -> +1..2, перелетает -> -1..2
     perfectTol = 3.5,      -- допуск для идеального попадания
-    normalCenter = 123,    -- нажатие реально приземляется на ~5 градусов раньше центра (упреждение+кадр), поэтому 123 = попадание ~118, после белой (104..114); попадает на белую -> +2, мимо зоны -> -2
+    normalCenter = 127,    -- приземление ~ центр-5, т.е. ~122: заметно дальше белой (104..114). мажет мимо зоны -> -2, цепляет белую -> +2
     normalTol = 3,
     lead = 0.012,          -- упреждение в секундах; не доводит -> меньше, перелетает -> больше
+    trapSign = -1,         -- капкан: зона зеркальная (цель = Goal - центр). если тыкает не туда: пробуй trapSign = 1 и trapShift = 180
+    trapShift = 0,
     genRange = 12,
     playerRange = 12,
     trapRange = 8,
@@ -545,6 +547,12 @@ end
 local scN, scZ, scB = nil, nil, nil
 local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
+
+local function scReset()
+    scN, scZ, scB = nil, nil, nil
+    scLast, scPressed, scCtx = nil, false, nil
+    scT = 1 -- сразу перепоиск
+end
 
 local function scFindAll()
     scN, scZ, scB = nil, nil, nil
@@ -689,6 +697,12 @@ local function scPress()
     end)
 end
 
+connect(player.CharacterAdded, scReset)
+do
+    local pg0 = player:FindFirstChild("PlayerGui")
+    if pg0 then connect(pg0.ChildAdded, scReset) end
+end
+
 local function scActive()
     return SC.generator or SC.heal or SC.trap
 end
@@ -696,17 +710,18 @@ end
 local function scStep(dt)
     if not scActive() then
         scLast = nil
+        scN, scZ = nil, nil
         return
     end
 
     scT = scT + dt
-    local stale = (not scN) or (not scN.Parent)
+    local stale = (not scN) or (not scZ) or (not scN:IsDescendantOf(game)) or (not scZ:IsDescendantOf(game))
     if (stale and scT >= 0.2) or scT >= 2 then
         scT = 0
         scFindAll()
     end
 
-    if not scN or not scZ or not scN.Parent or not scGuiVisible(scN) then
+    if stale or not scN or not scZ or not scGuiVisible(scN) then
         scLast, scPressed, scCtx = nil, false, nil
         return
     end
@@ -742,14 +757,16 @@ local function scStep(dt)
 
     local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
     local tol = SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol
-    local target = scZ.Rotation + center
+    local sign, shift = 1, 0
+    if ctx == "trap" then sign, shift = SC_CFG.trapSign, SC_CFG.trapShift end
+    local target = scZ.Rotation + shift + sign * center
 
     local diffNow = scDiff(rot, target)
     local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
     if diffNow * diffNext <= 0 and math.abs(diffNow) < 40 then
-        print("[SC] press", ctx, "id=" .. tostring(rawId), math.floor(rot), math.floor(target))
+        print("[SC] press", ctx, "id=" .. tostring(rawId), "rot=" .. math.floor(rot), "target=" .. math.floor(target), "vel=" .. math.floor(vel))
         scPressed = true
         scPressTime = os.clock()
         scPress()
