@@ -213,11 +213,6 @@ local COLOR_FILE = "vd_esp_colors.json"
 local DEFAULT_COLORS = {
     survivors = Color3.fromRGB(80, 255, 130),
     killer = Color3.fromRGB(255, 60, 60),
-    generators = Color3.fromRGB(255, 220, 60),
-    hooks = Color3.fromRGB(255, 90, 90),
-    gates = Color3.fromRGB(90, 255, 130),
-    pallets = Color3.fromRGB(255, 160, 60),
-    windows = Color3.fromRGB(120, 200, 255),
 }
 
 local ESPColors = {}
@@ -290,25 +285,7 @@ local espFolder = new("Folder", {Name = "ESP"}, gui)
 local ESP = {
     survivors = false,
     killer = false,
-    generators = false,
-    hooks = false,
-    gates = false,
-    pallets = false,
-    windows = false,
     names = true,
-}
-
--- names  - точные имена (lowercase), words - подстроки в имени,
--- anchor - имя части внутри объекта, к которой цепляется метка,
--- highlight - контур; у Roblox лимит ~31 Highlight на экран, поэтому hlCap на категорию:
--- 12 + 8 + 4 + игроки (~5) влезает. Если объект не подсвечен — "Dump map info" (F9),
--- смотри реальные имена и допиши в words/names.
-local ESP_CATS = {
-    generators = {words = {"generator"}, anchor = "HitBox", label = "Generator", highlight = true, hlCap = 12},
-    hooks = {words = {"hook"}, anchor = "HookPoint", label = "Hook", highlight = true, hlCap = 8},
-    gates = {words = {"gate", "exit"}, label = "Gate", highlight = true, hlCap = 4},
-    pallets = {words = {"pallet"}, anchor = "HumanoidRootPart", label = "Pallet"},
-    windows = {names = {"window"}, anchor = "inviswall", label = "Window"},
 }
 
 local espItems = {}
@@ -440,132 +417,9 @@ local function espRefreshPlayers()
     end
 end
 
-local function espNameHas(inst, cat)
-    local def = ESP_CATS[cat]
-    local n = string.lower(inst.Name)
-    if def.names then
-        for _, w in ipairs(def.names) do
-            if n == w then return true end
-        end
-    end
-    if def.words then
-        for _, w in ipairs(def.words) do
-            if string.find(n, w, 1, true) then return true end
-        end
-    end
-    return false
-end
-
-local function espHlCount(cat)
-    local n = 0
-    for _, it in pairs(espItems) do
-        if it.cat == cat and it.hl then n = n + 1 end
-    end
-    return n
-end
-
--- есть ли выше по дереву Model/BasePart с тем же совпадением (берём только самый верхний)
-local function espHasMatchingAncestor(obj, cat)
-    local p = obj.Parent
-    while p and p ~= workspace do
-        if (p:IsA("Model") or p:IsA("BasePart")) and espNameHas(p, cat) then return true end
-        p = p.Parent
-    end
-    return false
-end
-
--- внутри персонажа (аксессуары и т.п.) не трогаем
-local function espInsideCharacter(obj)
-    local p = obj.Parent
-    while p and p ~= workspace do
-        if p:FindFirstChildOfClass("Humanoid") then return true end
-        p = p.Parent
-    end
-    return false
-end
-
-local function espConsider(obj)
-    if espItems[obj] then return end
-    if not (obj:IsA("Model") or obj:IsA("BasePart")) then return end -- папки не берём: "Generators" folder ломала дедуп
-    if obj:FindFirstChildOfClass("Humanoid") then return end
-    for cat, def in pairs(ESP_CATS) do
-        if ESP[cat] and espNameHas(obj, cat) then
-            if espHasMatchingAncestor(obj, cat) or espInsideCharacter(obj) then return end
-
-            local part = def.anchor and obj:FindFirstChild(def.anchor, true)
-            if not (part and part:IsA("BasePart")) then
-                part = obj:IsA("BasePart") and obj or obj:FindFirstChildWhichIsA("BasePart", true)
-            end
-            if not part then return end
-
-            local color = ESPColors[cat]
-            local hl = nil
-            if def.highlight and espHlCount(cat) < (def.hlCap or 8) then
-                hl = new("Highlight", {
-                    Adornee = obj,
-                    FillColor = color,
-                    OutlineColor = color,
-                    FillTransparency = 0.75,
-                    OutlineTransparency = 0,
-                    DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-                }, espFolder)
-            end
-            local bb, lbl = espMakeTag(part, color)
-            local extra = nil
-            if cat == "generators" then
-                extra = function()
-                    local pr = obj:GetAttribute("RepairProgress")
-                    if type(pr) == "number" then
-                        return string.format("Generator %d%%", math.floor(pr + 0.5))
-                    end
-                    return "Generator"
-                end
-            end
-            espItems[obj] = {
-                kind = "object", cat = cat, target = obj, part = part,
-                hl = hl, bb = bb, lbl = lbl, text = def.label, extra = extra,
-            }
-            return
-        end
-    end
-end
-
--- скан по всему workspace, порциями, чтобы не фризить (особенно на телефоне)
-local espScanning = false
-local function espScan()
-    if espScanning then return end
-    espScanning = true
-    task.spawn(function()
-        local n = 0
-        for _, obj in ipairs(workspace:GetDescendants()) do
-            if obj:IsA("Model") or obj:IsA("BasePart") then
-                pcall(espConsider, obj)
-            end
-            n = n + 1
-            if n % 1500 == 0 then task.wait() end
-        end
-        espScanning = false
-    end)
-end
-
-local function espAnyObject()
-    for cat in pairs(ESP_CATS) do
-        if ESP[cat] then return true end
-    end
-    return false
-end
-
 local function espSet(flag, v)
     ESP[flag] = v
-    if flag == "survivors" or flag == "killer" then
-        espRefreshPlayers()
-    elseif ESP_CATS[flag] then
-        if v then
-            espScan()
-        else
-            espClear(function(it) return it.cat == flag end)
-        end
-    end
+    espRefreshPlayers()
 end
 
 local function espDump()
@@ -595,29 +449,10 @@ local function espDump()
     print("---- end ----")
 end
 
-connect(workspace.DescendantAdded, function(obj)
-    if not espAnyObject() then return end
-    if obj:IsA("Model") or obj:IsA("BasePart") then
-        local relevant = false
-        for cat in pairs(ESP_CATS) do
-            if ESP[cat] and espNameHas(obj, cat) then
-                relevant = true
-                break
-            end
-        end
-        if relevant then
-            task.delay(1, function()
-                if obj.Parent then espConsider(obj) end
-            end)
-        end
-    end
-end)
-
-local espT1, espT2, espT3 = 0, 0, 0
+local espT1, espT2 = 0, 0
 connect(RunService.Heartbeat, function(dt)
     espT1 = espT1 + dt
     espT2 = espT2 + dt
-    espT3 = espT3 + dt
 
     if espT1 >= 0.1 then
         espT1 = 0
@@ -640,16 +475,6 @@ connect(RunService.Heartbeat, function(dt)
     if espT2 >= 0.5 then
         espT2 = 0
         if ESP.survivors or ESP.killer then espRefreshPlayers() end
-        for key, it in pairs(espItems) do
-            if it.kind == "object" and not it.target:IsDescendantOf(workspace) then
-                espRemove(key)
-            end
-        end
-    end
-
-    if espT3 >= 10 then
-        espT3 = 0
-        if espAnyObject() then espScan() end
     end
 end)
 
@@ -680,11 +505,11 @@ local SC_CFG = {
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    perfectCenter = 109,   -- середина идеальной зоны (104..114)
+    perfectCenter = 111,   -- точка нажатия в идеальной зоне (104..114); не доводит -> +1..2, перелетает -> -1..2
     perfectTol = 3.5,      -- допуск для идеального попадания
     normalCenter = 118,    -- точка обычного попадания (чуть после 115)
     normalTol = 3,
-    lead = 0.03,           -- упреждение в секундах (задержка нажатия)
+    lead = 0.012,          -- упреждение в секундах; не доводит -> меньше, перелетает -> больше
     genRange = 12,
     playerRange = 12,
     trapRange = 8,
@@ -915,7 +740,7 @@ local function scStep(dt)
     local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
-    if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or math.abs(diffNext) <= tol then
+    if diffNow * diffNext <= 0 and math.abs(diffNow) < 40 then
         print("[SC] press", ctx, math.floor(rot), math.floor(target))
         scPressed = true
         scPressTime = os.clock()
@@ -1636,37 +1461,10 @@ addToggle("Killer", false, function(v)
     espSet("killer", v)
 end, "espkiller")
 
-addSection("Objects")
-
-addToggle("Generators", false, function(v)
-    espSet("generators", v)
-end, "espgen")
-
-addToggle("Hooks", false, function(v)
-    espSet("hooks", v)
-end, "esphook")
-
-addToggle("Gates / Exits", false, function(v)
-    espSet("gates", v)
-end, "espgate")
-
-addToggle("Pallets", false, function(v)
-    espSet("pallets", v)
-end, "esppallet")
-
-addToggle("Windows", false, function(v)
-    espSet("windows", v)
-end, "espwindow")
-
 addSection("Colors")
 
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
-addColorRow("Generators", "generators")
-addColorRow("Hooks", "hooks")
-addColorRow("Gates / Exits", "gates")
-addColorRow("Pallets", "pallets")
-addColorRow("Windows", "windows")
 
 addButton("Сбросить цвета", function()
     for k, v in pairs(DEFAULT_COLORS) do
