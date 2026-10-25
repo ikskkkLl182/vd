@@ -513,10 +513,34 @@ local SC_CFG = {
     trapSign = -1,         -- капкан: зона зеркальная (цель = Goal - центр). если тыкает не туда: пробуй trapSign = 1 и trapShift = 180
     trapShift = 0,
     trapExtra = -26,       -- капкан: сдвиг цели (градусы). минус = жмёт ПОЗЖЕ (стрелка идёт по часовой, sign=-1 инвертирует знак). замер по записи: нажатие приземлялось ~28 градусов до квадрата. не дотягивает -> -2, перелетает -> +2
+    ghExtra = 18,          -- гены/лечение: сдвиг цели (градусы). замер по записи: жало на ~15-20 градусов раньше квадрата. плюс = жмёт ПОЗЖЕ. докрутка кнопками в меню
     genRange = 12,
     playerRange = 12,
     trapRange = 8,
 }
+
+-- калибровка (сохраняется в файл, кнопки в меню правят на лету)
+local CAL_FILE = "vd_esp_cal.json"
+local SC_CAL = { gh = SC_CFG.ghExtra, trap = SC_CFG.trapExtra } -- gh = generator + heal
+if readfile and isfile then
+    pcall(function()
+        if isfile(CAL_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(CAL_FILE))
+            if type(decoded) == "table" then
+                for k, v in pairs(decoded) do
+                    if SC_CAL[k] ~= nil and type(v) == "number" then SC_CAL[k] = v end
+                end
+            end
+        end
+    end)
+end
+
+local function saveCal()
+    if not writefile then return end
+    pcall(function()
+        writefile(CAL_FILE, HttpService:JSONEncode(SC_CAL))
+    end)
+end
 
 local function scMatch(name, words)
     name = string.lower(name)
@@ -758,8 +782,11 @@ local function scStep(dt)
 
     local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
     local tol = SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol
-    local sign, shift, extra = 1, 0, 0
-    if ctx == "trap" then sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CFG.trapExtra end
+    local sign, shift = 1, 0
+    local extra = SC_CAL.gh -- гены / лечение / "any"
+    if ctx == "trap" then
+        sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CAL.trap
+    end
     local target = scZ.Rotation + shift + sign * (center + extra)
 
     local diffNow = scDiff(rot, target)
@@ -767,7 +794,7 @@ local function scStep(dt)
 
     -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
     if diffNow * diffNext <= 0 and math.abs(diffNow) < 40 then
-        print("[SC] press", ctx, "id=" .. tostring(rawId), "rot=" .. math.floor(rot), "target=" .. math.floor(target), "vel=" .. math.floor(vel))
+        print("[SC] press", ctx, "id=" .. tostring(rawId), "rot=" .. math.floor(rot), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(vel))
         scPressed = true
         scPressTime = os.clock()
         scPress()
@@ -1067,6 +1094,7 @@ local function addButton(text, callback)
         tween(btn, {BackgroundColor3 = THEME.hover}, 0.3)
         pcall(callback)
     end)
+    return btn
 end
 
 ---------------------------------------------------------------------
@@ -1523,6 +1551,30 @@ end, "scperfect")
 
 addButton("Dump skill check GUI (3s delay, F9)", scDump)
 
+-- докрутка тайминга: gh = гены + лечение, trap = капкан
+-- gh: плюс = жмёт ПОЗЖЕ. trap: плюс = жмёт РАНЬШЕ (зеркало, sign = -1)
+local calBtns = {}
+local function calRefresh()
+    for _, e in ipairs(calBtns) do
+        e.btn.Text = string.format("%s: жать %s (сейчас %d°)", e.name, e.word, SC_CAL[e.key])
+    end
+end
+
+local function addCal(name, key, step, word)
+    local btn = addButton("", function()
+        SC_CAL[key] = SC_CAL[key] + step
+        saveCal()
+        calRefresh()
+    end)
+    table.insert(calBtns, {btn = btn, name = name, key = key, word = word})
+end
+
+addCal("Gen/Heal", "gh", 2, "ПОЗЖЕ +2°")
+addCal("Gen/Heal", "gh", -2, "РАНЬШЕ -2°")
+addCal("Trap", "trap", -2, "ПОЗЖЕ -2°")
+addCal("Trap", "trap", 2, "РАНЬШЕ +2°")
+calRefresh()
+
 addSection("Settings")
 
 addToggle("Names / distance", true, function(v)
@@ -1598,6 +1650,7 @@ end)
 ---------------------------------------------------------------------
 env.__VDEspCleanup = function()
     saveColors()
+    saveCal()
     for k in pairs(ESP) do
         if k ~= "names" then ESP[k] = false end
     end
