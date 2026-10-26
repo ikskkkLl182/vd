@@ -1,7 +1,7 @@
--- pups - Violence District ESP + auto skill check (generators / healing)
+-- pups - Violence District ESP + auto skill check
 -- floating icon (mobile), K key (PC), ESP color picker
 -- mobile skill check: exact button path + GuiInset + SendTouchEvent
--- generator and heal checks are classified independently on every new check
+-- single auto skill check toggle (works for generators and healing), one perfect/normal switch
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -518,7 +518,7 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check (generators / healing)
+-- auto skill check (single toggle for all checks)
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
@@ -526,10 +526,8 @@ pcall(function()
 end)
 
 local SC = {
-    generator = false,
-    heal = false,
-    genPerfect = true,
-    healPerfect = true,
+    enabled = false,
+    perfect = true,
 }
 
 local SC_CFG = {
@@ -544,8 +542,6 @@ local SC_CFG = {
     normalTol = 3,
     lead = 0.012,
     ghExtra = 0,
-    genRange = 12,
-    playerRange = 12,
     actionPath = "Survivor-mob.Controls.action.check",
     touchId = 8822,
 }
@@ -651,11 +647,9 @@ local function scFindAll()
 end
 
 local SC_IDS = {
-    generator = {"gen"},
-    heal = {"heal"},
     trap = {"trap"},
 }
-local SC_ORDER = {"generator", "heal", "trap"}
+local SC_ORDER = {"trap"}
 
 local function scCtxFromChar()
     local chr = player.Character
@@ -670,107 +664,6 @@ local function scCtxFromChar()
         end
     end
     return nil
-end
-
--- classify every check independently:
--- 1) character attributes
--- 2) playing animations
--- 3) proximity (generators vs injured / downed teammates only)
-local function scCtxProximity()
-    local chr = player.Character
-    if not chr then return nil end
-    local root = chr:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-    local hum = chr:FindFirstChildOfClass("Humanoid")
-    local pos = root.Position
-
-    local attrNames = {
-        "Repairing", "IsRepairing", "Repair", "IsRepair",
-        "Healing", "IsHealing", "Heal", "IsHeal",
-        "CurrentAction", "Action", "ActionType", "State"
-    }
-    for _, attrName in ipairs(attrNames) do
-        local val = chr:GetAttribute(attrName)
-        if val == true then
-            local n = string.lower(attrName)
-            if string.find(n, "repair", 1, true) or string.find(n, "gen", 1, true) then
-                return "generator"
-            end
-            if string.find(n, "heal", 1, true) then
-                return "heal"
-            end
-        elseif type(val) == "string" then
-            local v = string.lower(val)
-            if string.find(v, "repair", 1, true) or string.find(v, "generator", 1, true) then
-                return "generator"
-            end
-            if string.find(v, "heal", 1, true) then
-                return "heal"
-            end
-        end
-    end
-
-    local animator = hum and hum:FindFirstChildOfClass("Animator")
-    if animator then
-        for _, track in ipairs(animator:GetPlayingAnimationTracks()) do
-            local trackAnim = track.Animation
-            if trackAnim then
-                local animName = string.lower(trackAnim.Name)
-                if string.find(animName, "repair", 1, true) or string.find(animName, "fix", 1, true) or string.find(animName, "generator", 1, true) then
-                    return "generator"
-                end
-                if string.find(animName, "heal", 1, true) or string.find(animName, "revive", 1, true) then
-                    return "heal"
-                end
-            end
-        end
-    end
-
-    local bestKind, bestDist = nil, math.huge
-    local function consider(kind, dist, range)
-        if dist <= range and dist < bestDist then
-            bestKind, bestDist = kind, dist
-        end
-    end
-
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and string.lower(obj.Name) == "generator" and not obj:FindFirstChildOfClass("Humanoid") then
-            local ok, cf = pcall(function() return obj:GetPivot() end)
-            if ok then
-                local progress = obj:GetAttribute("RepairProgress") or obj:GetAttribute("Progress") or 0
-                local dist = (cf.Position - pos).Magnitude
-                if progress > 0 then
-                    consider("generator", dist * 0.5, SC_CFG.genRange)
-                else
-                    consider("generator", dist, SC_CFG.genRange)
-                end
-            end
-        end
-    end
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player and not espIsKiller(plr) then
-            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-            local pHum = plr.Character and plr.Character:FindFirstChildOfClass("Humanoid")
-            if r then
-                local isInjured = pHum and pHum.Health < pHum.MaxHealth
-                local isDowned = false
-                if plr.Character then
-                    for _, attr in ipairs({"Knocked", "Downed", "IsDowned", "IsHooked", "Hooked"}) do
-                        if plr.Character:GetAttribute(attr) == true then
-                            isDowned = true
-                            break
-                        end
-                    end
-                end
-                if isInjured or isDowned then
-                    consider("heal", (r.Position - pos).Magnitude, SC_CFG.playerRange)
-                end
-            end
-        end
-    end
-
-    return bestKind
 end
 
 local function scGetActionTarget()
@@ -889,7 +782,7 @@ do
 end
 
 local function scStep(dt)
-    if not (SC.generator or SC.heal) then
+    if not SC.enabled then
         scLast = nil
         scN, scZ = nil, nil
         scCtx = nil
@@ -940,26 +833,14 @@ local function scStep(dt)
     local ctx, rawId = scCtxFromChar()
     if not ctx then
         if scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
-            scCtx = scCtxProximity() or "any"
+            scCtx = "any"
         end
         ctx = scCtx
     end
     if not ctx then return end
     if ctx == "trap" then return end
-    if ctx ~= "any" and not SC[ctx] then return end
 
-    local perfect
-    if ctx == "heal" then
-        perfect = SC.healPerfect
-    elseif ctx == "generator" then
-        perfect = SC.genPerfect
-    else
-        if SC.heal and not SC.generator then
-            perfect = SC.healPerfect
-        else
-            perfect = SC.genPerfect
-        end
-    end
+    local perfect = SC.perfect
 
     local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
     local tol = perfect and SC_CFG.perfectTol or SC_CFG.normalTol
@@ -1784,21 +1665,13 @@ end, "espnames")
 
 addSection("Auto Skill Check")
 
-addToggle("Generators", false, function(v)
-    SC.generator = v
-end, "scgen")
+addToggle("Auto Skill Check", false, function(v)
+    SC.enabled = v
+end, "scenabled")
 
-addToggle("Generators: perfect (off = normal)", true, function(v)
-    SC.genPerfect = v
-end, "scgenperfect")
-
-addToggle("Heal teammates", false, function(v)
-    SC.heal = v
-end, "scheal")
-
-addToggle("Heal: perfect (off = normal)", true, function(v)
-    SC.healPerfect = v
-end, "schealperfect")
+addToggle("Perfect (off = normal)", true, function(v)
+    SC.perfect = v
+end, "scperfect")
 
 addSection("Settings")
 
@@ -1880,7 +1753,7 @@ env.__VDEspCleanup = function()
     end
     espClear()
 
-    SC.generator, SC.heal = false, false
+    SC.enabled = false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
