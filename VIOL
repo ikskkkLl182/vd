@@ -550,7 +550,7 @@ local SC_CFG = {
     normalTol = 3,
     lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
     ghExtra = 0,           -- extra target shift (degrees). plus = press later
-    trapCenter = 111,      -- trap: press point from the zone; the side follows the needle direction
+    trapZone = -75,        -- trap: zone position relative to Goal.Rotation, along the needle travel (measured from video)
     trapTol = 3.5,         -- trap: tolerance for the press
     genRange = 12,
     playerRange = 12,
@@ -717,17 +717,20 @@ local function scSendTrapResult()
     return (pcall(function() r:FireServer(TRAP_GRADE) end))
 end
 
-local scTrapSide = 1       -- +1 / -1: flips when our press was a miss (learns the mirror side)
+local TRAP_NUDGES = {0, 3, -3, 6, -6, 9, -9}  -- degrees tried around trapZone when a press was not perfect
+local scTrapNudgeIdx = 1
+local scTrapNudge = 0
 local scTrapPressed = false -- we pressed for a trap check and wait for its grade
 
 local function scTrapGrade(grade)
     if scTrapPressed then
         scTrapPressed = false
-        if grade == "miss" then
-            scTrapSide = -scTrapSide
-            print("[SC] trap: our press missed -> side is now", scTrapSide)
+        if grade == "perfect" then
+            print("[SC] trap: our press was perfect (nudge " .. scTrapNudge .. ")")
         else
-            print("[SC] trap: our press graded", grade, "(side", scTrapSide .. ")")
+            scTrapNudgeIdx = scTrapNudgeIdx % #TRAP_NUDGES + 1
+            scTrapNudge = TRAP_NUDGES[scTrapNudgeIdx]
+            print("[SC] trap: our press was", grade, "-> nudge now", scTrapNudge)
         end
     else
         print("[SC] trap: client graded", grade, "without our press")
@@ -945,11 +948,11 @@ local function scStep(dt)
 
     local tol
     if ctx == "trap" then
-        -- trap checks are always pressed on the perfect zone; the zone lies ahead of the needle,
-        -- so the offset sign follows the needle direction (and the learned mirror side)
+        -- trap checks are always pressed on the perfect zone; the zone offset is measured along
+        -- the needle travel direction, so it works whichever way the needle turns
         perfect = true
-        local sign = (vel >= 0 and 1 or -1) * scTrapSide
-        target = scZ.Rotation + sign * SC_CFG.trapCenter
+        local dirSign = vel >= 0 and 1 or -1
+        target = scZ.Rotation + dirSign * (SC_CFG.trapZone + scTrapNudge)
         tol = SC_CFG.trapTol
     else
         if ctx == "heal" then
@@ -971,7 +974,7 @@ local function scStep(dt)
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
         print("[SC] press", tag, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
             "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel),
-            ctx == "trap" and ("side=" .. scTrapSide) or "")
+            ctx == "trap" and ("nudge=" .. scTrapNudge) or "")
         if ctx == "trap" then scTrapPressed = true end
         scPressed = true
         scPressTime = os.clock()
