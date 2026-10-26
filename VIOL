@@ -590,6 +590,10 @@ local scLastG, scPrevLV = nil, nil    -- trap: previous needle angle on screen /
 local scPressSrcFn, scPressSrcV = nil, nil
 local scStill, scReleasedAt = 0, 0
 local scTrapFails, scGeoOff = 0, false
+local scMoveStart, scWasMoving, scReplayAt = 0, false, 0   -- trap: when the needle started moving / last remote replay
+local SC_REMOTE = nil                                       -- {segs, args, delay}: learned trap result remote
+local scRemoteSave = nil
+local scOutAlive = true
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
@@ -1089,7 +1093,12 @@ local function scTrapWatch(tag)
         local now = c2 and c2:GetAttribute("TrapFailedAt")
         if now ~= mark then
             scTrapFails = scTrapFails + 1
-            if SC_LEARN.src and scTrapFails >= TRAP_CFG.relearnFails then
+            if tag == "trap(remote)" and scTrapFails >= TRAP_CFG.relearnFails then
+                print("[SC] trap: remote replay keeps failing, relearning")
+                SC_REMOTE = nil
+                scRemoteSave({})
+                scTrapFails = 0
+            elseif SC_LEARN.src and scTrapFails >= TRAP_CFG.relearnFails then
                 print("[SC] trap: learned source keeps failing, relearning")
                 SC_LEARN.src, SC_LEARN.recs = nil, {}
                 scLearnSave({})
@@ -1133,6 +1142,175 @@ connect(UserInputService.InputBegan, function(input)
     end)
 end)
 
+---------------------------------------------------------------------
+-- trap result remote
+-- the game reports every skill check result to the server through a RemoteEvent
+-- (generators: Remotes.Generator.SkillCheckResultEvent:FireServer("success", 1, gen, part)).
+-- pups listens to the game's own outgoing calls while you are trapped, remembers the
+-- successful one and replays it for every following trap check. no zone math needed.
+---------------------------------------------------------------------
+local REMOTE_FILE = "vd_esp_trap_remote.json"
+
+scRemoteSave = function(data)
+    if not writefile then return end
+    pcall(function()
+        writefile(REMOTE_FILE, HttpService:JSONEncode(data or {}))
+    end)
+end
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(REMOTE_FILE) then
+            local d = HttpService:JSONDecode(readfile(REMOTE_FILE))
+            if type(d) == "table" and type(d.segs) == "table" and type(d.args) == "table" then
+                SC_REMOTE = {segs = d.segs, args = d.args, delay = tonumber(d.delay) or 0.8}
+            end
+        end
+    end)
+end
+
+local function scEncodeArg(v)
+    local t = typeof(v)
+    if t == "number" or t == "string" or t == "boolean" then return {t = "v", v = v} end
+    if t == "Instance" then
+        if v == player.Character then return {t = "me"} end
+        if v == player then return {t = "player"} end
+        return {t = "inst", name = v.Name, class = v.ClassName}
+    end
+    return nil
+end
+
+-- nearest instance with this name / class (trap models are different objects every match)
+local function scNearest(name, class)
+    local chr = player.Character
+    local root = chr and chr:FindFirstChild("HumanoidRootPart")
+    local best, bd = nil, math.huge
+    for _, o in ipairs(workspace:GetDescendants()) do
+        if o.Name == name and o.ClassName == class then
+            local pos = nil
+            if o:IsA("BasePart") then
+                pos = o.Position
+            elseif o:IsA("Model") then
+                local ok, cf = pcall(function() return o:GetPivot() end)
+                if ok then pos = cf.Position end
+            end
+            if pos then
+                local d = root and (pos - root.Position).Magnitude or 0
+                if d < bd then best, bd = o, d end
+            end
+        end
+    end
+    return best
+end
+
+local function scDecodeArgs(enc)
+    local args = {}
+    for i, e in ipairs(enc) do
+        if e.t == "v" then
+            args[i] = e.v
+        elseif e.t == "me" then
+            args[i] = player.Character
+        elseif e.t == "player" then
+            args[i] = player
+        else
+            args[i] = scNearest(e.name, e.class)
+        end
+    end
+    return args
+end
+
+local function scResolveRemote(segs)
+    local o = game
+    for i, name in ipairs(segs) do
+        if i == 1 then
+            local ok, svc = pcall(function() return game:GetService(name) end)
+            o = (ok and svc) or game:FindFirstChild(name)
+        else
+            o = o and o:FindFirstChild(name)
+        end
+        if not o then return nil end
+    end
+    return o
+end
+
+local function scReplayRemote()
+    if not SC_REMOTE then return false end
+    local r = scResolveRemote(SC_REMOTE.segs)
+    if not (r and r:IsA("RemoteEvent")) then return false end
+    local args = scDecodeArgs(SC_REMOTE.args)
+    local n = #SC_REMOTE.args
+    return (pcall(function() r:FireServer(table.unpack(args, 1, n)) end))
+end
+
+-- one-time list of all remotes (to see how the game names its trap remote)
+local scTreePrinted = false
+local function scPrintRemotes()
+    if scTreePrinted then return end
+    scTreePrinted = true
+    local lines = {}
+    for _, d in ipairs(game:GetService("ReplicatedStorage"):GetDescendants()) do
+        if d:IsA("RemoteEvent") or d:IsA("RemoteFunction") then
+            table.insert(lines, d.ClassName .. " " .. d:GetFullName())
+        end
+    end
+    local text = table.concat(lines, "\n")
+    print("---- remotes ----\n" .. text .. "\n---- end ----")
+    if setclipboard then pcall(setclipboard, text) end
+end
+
+-- the game's own outgoing calls while trapped
+local function scNoteOutgoing(remote, method, ...)
+    if not scIsTrapped() then return end
+    local segs, o = {}, remote
+    while o and o ~= game do
+        table.insert(segs, 1, o.Name)
+        o = o.Parent
+    end
+    local path = table.concat(segs, ".")
+    local lp = string.lower(path)
+    if not (string.find(lp, "skill", 1, true) or string.find(lp, "trap", 1, true) or string.find(lp, "escape", 1, true)) then
+        return
+    end
+    local args = table.pack(...)
+    local enc, shown = {}, {}
+    for i = 1, args.n do
+        local e = scEncodeArg(args[i])
+        if not e then
+            print("[SC] trap remote " .. path .. ": arg " .. i .. " has unsupported type " .. typeof(args[i]))
+            return
+        end
+        enc[i] = e
+        shown[i] = tostring(args[i])
+    end
+    print("[SC] trap remote seen:", path, method, "(" .. table.concat(shown, ", ") .. ")")
+    if method ~= "FireServer" or not SC.trap or SC_REMOTE then return end
+    local first = type(args[1]) == "string" and string.lower(args[1]) or ""
+    if string.find(first, "fail", 1, true) or string.find(first, "miss", 1, true) then return end
+    local delay = scWasMoving and (os.clock() - scMoveStart) or 0.8
+    local chr = player.Character
+    local mark = chr and chr:GetAttribute("TrapFailedAt")
+    task.delay(0.45, function()
+        local c2 = player.Character
+        if c2 and c2:GetAttribute("TrapFailedAt") ~= mark then return end -- that check failed
+        if SC_REMOTE then return end
+        SC_REMOTE = {segs = segs, args = enc, delay = math.clamp(delay, 0.15, 3)}
+        scRemoteSave(SC_REMOTE)
+        print("[SC] trap remote learned:", path, "(" .. table.concat(shown, ", ") .. ")", "delay=" .. string.format("%.2f", SC_REMOTE.delay))
+    end)
+end
+
+if hookmetamethod and checkcaller and getnamecallmethod then
+    local oldNC
+    oldNC = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
+        local method = getnamecallmethod()
+        if scOutAlive and (method == "FireServer" or method == "InvokeServer") and not checkcaller() then
+            pcall(scNoteOutgoing, self, method, ...)
+            if setnamecallmethod then setnamecallmethod(method) end
+        end
+        return oldNC(self, ...)
+    end))
+end
+
 connect(player.CharacterAdded, scReset)
 do
     local pg0 = player:FindFirstChild("PlayerGui")
@@ -1155,6 +1333,7 @@ local function scStep(dt)
 
     if stale or not scN or not scZ or not scGuiVisible(scN) then
         scLast, scPressed, scCtx, scLastG, scPrevLV, scStill = nil, false, nil, nil, nil, 0
+        scWasMoving = false
         return
     end
 
@@ -1175,6 +1354,7 @@ local function scStep(dt)
             scStill = 0
             scPrevLV, scLastG = nil, nil
             scReleasedAt = os.clock()
+            scMoveStart = scReleasedAt
         end
         scLast = rot
         return
@@ -1188,7 +1368,11 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then scLastG = nil return end -- needle is not moving yet
+    if math.abs(vel) < 20 then scLastG = nil scWasMoving = false return end -- needle is not moving yet
+    if not scWasMoving then
+        scWasMoving = true
+        scMoveStart = os.clock()
+    end
 
     -- which skill check: trapped state first, then the character id, then proximity
     local ctx, rawId = scCtxFromChar()
@@ -1207,6 +1391,23 @@ local function scStep(dt)
     local perfect = true
 
     if ctx == "trap" then
+        scPrintRemotes()
+        if SC_REMOTE then
+            -- replay the game's own success report instead of timing the needle
+            local now = os.clock()
+            if now - scMoveStart < SC_REMOTE.delay or now - scReplayAt < 0.4 then return end
+            scReplayAt = now
+            if scReplayRemote() then
+                print("[SC] trap remote sent")
+                scPressed = true
+                scPressTime = now
+                scPressDir = vel >= 0 and 1 or -1
+                scPressGoal = scZ.Rotation
+                scPressSrcFn, scPressSrcV = nil, nil
+                scTrapWatch("trap(remote)")
+            end
+            return
+        end
         local src = SC_LEARN.src
         local lv = src and scLearnVal() or nil
         if lv then
@@ -2104,6 +2305,7 @@ env.__VDEspCleanup = function()
     espClear()
 
     SC.generator, SC.heal, SC.trap = false, false, false
+    scOutAlive = false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
