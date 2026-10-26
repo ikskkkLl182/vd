@@ -1,12 +1,11 @@
--- pups - Violence District ESP + auto skill check
--- floating icon (mobile), K key (PC), ESP color picker
+-- pups - Violence District ESP + auto skill check (generators / healing)
+-- floating icon (mobile), K key (PC), ESP color picker, menu size slider
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
-local VirtualInputManager = game:GetService("VirtualInputManager")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -213,11 +212,9 @@ end)
 local COLOR_FILE = "vd_esp_colors.json"
 
 local DEFAULT_COLORS = {
-    survivors = Color3.fromRGB(60, 255, 60),
+    survivors = Color3.fromRGB(80, 255, 130),
     killer = Color3.fromRGB(255, 60, 60),
-    generators = Color3.fromRGB(255, 255, 0),
-    generatorsdone = Color3.fromRGB(0, 255, 0),
-    traps = Color3.fromRGB(255, 0, 255),
+    generators = Color3.fromRGB(255, 220, 60),
 }
 
 local ESPColors = {}
@@ -256,6 +253,31 @@ local function saveColors()
 end
 
 ---------------------------------------------------------------------
+-- ui settings (menu size, saved to file)
+---------------------------------------------------------------------
+local UI_FILE = "vd_esp_ui.json"
+local MENU_SCALE_MIN, MENU_SCALE_MAX = 0.5, 1.2
+local menuScale = 0.75
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(UI_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(UI_FILE))
+            if type(decoded) == "table" and type(decoded.scale) == "number" then
+                menuScale = math.clamp(decoded.scale, MENU_SCALE_MIN, MENU_SCALE_MAX)
+            end
+        end
+    end)
+end
+
+local function saveUi()
+    if not writefile then return end
+    pcall(function()
+        writefile(UI_FILE, HttpService:JSONEncode({scale = menuScale}))
+    end)
+end
+
+---------------------------------------------------------------------
 -- gui root
 ---------------------------------------------------------------------
 local gui = new("ScreenGui", {
@@ -282,318 +304,562 @@ local function mount()
 end
 mount()
 
-local playerGui = player:WaitForChild("PlayerGui")
+---------------------------------------------------------------------
+-- ESP
+---------------------------------------------------------------------
+local espFolder = new("Folder", {Name = "ESP"}, gui)
 
----------------------------------------------------------------------
--- ESP (highlights parented into the character / generator model)
----------------------------------------------------------------------
 local ESP = {
     survivors = false,
     killer = false,
     generators = false,
-    traps = false,
+    names = true,
 }
 
-local function IsKiller(plr)
-    return plr and plr.Team and plr.Team.Name == "Killer"
+local espItems = {}
+
+local function espRemove(key)
+    local it = espItems[key]
+    if not it then return end
+    espItems[key] = nil
+    pcall(function() if it.hl then it.hl:Destroy() end end)
+    pcall(function() it.bb:Destroy() end)
 end
 
-local function espUpdatePlayers()
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player then
-            local chr = plr.Character
-            if chr then
-                local killer = IsKiller(plr)
-                local want = (killer and ESP.killer) or ((not killer) and ESP.survivors)
-                local hl = chr:FindFirstChild("Independent_ESP")
-                if want then
-                    if not hl then
-                        hl = new("Highlight", {
-                            Name = "Independent_ESP",
-                            FillTransparency = 0.5,
-                            OutlineTransparency = 0,
-                        }, chr)
-                    end
-                    local color = killer and ESPColors.killer or ESPColors.survivors
-                    hl.FillColor = color
-                    hl.OutlineColor = color
-                elseif hl then
-                    hl:Destroy()
-                end
-            end
+local function espClear(filter)
+    for key, it in pairs(espItems) do
+        if not filter or filter(it) then
+            espRemove(key)
         end
     end
 end
 
-local genHls = {}
-
-local function genColor(model)
-    local progress = model:GetAttribute("RepairProgress") or model:GetAttribute("ProgressRepair") or 0
-    if type(progress) ~= "number" then progress = 0 end
-    local pct = math.clamp(progress / 100, 0, 1)
-    return ESPColors.generators:Lerp(ESPColors.generatorsdone, pct)
+local function espMakeTag(part, color)
+    local bb = new("BillboardGui", {
+        Adornee = part,
+        AlwaysOnTop = true,
+        Size = UDim2.fromOffset(150, 22),
+        StudsOffset = Vector3.new(0, 3, 0),
+        LightInfluence = 0,
+        ResetOnSpawn = false,
+    }, espFolder)
+    local lbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = color,
+        TextStrokeTransparency = 0.3,
+        Text = "",
+    }, bb)
+    return bb, lbl
 end
 
-local function espUpdateGenerators()
-    if not ESP.generators then
-        for m, hl in pairs(genHls) do
-            pcall(function() hl:Destroy() end)
-            genHls[m] = nil
-        end
-        return
-    end
-
-    local map = workspace:FindFirstChild("Map")
-    if not map then return end
-
-    for _, d in ipairs(map:GetDescendants()) do
-        if d:IsA("Model") and d.Name == "Generator" then
-            local hl = genHls[d]
-            if not (hl and hl.Parent) then
-                hl = new("Highlight", {
-                    Name = "Independent_Gen_ESP",
-                    FillTransparency = 0.5,
-                    OutlineTransparency = 0,
-                }, d)
-                genHls[d] = hl
-            end
-            local c = genColor(d)
-            hl.FillColor = c
-            hl.OutlineColor = c
-        end
-    end
-
-    for m, hl in pairs(genHls) do
-        if not m:IsDescendantOf(workspace) then
-            pcall(function() hl:Destroy() end)
-            genHls[m] = nil
-        end
-    end
-end
-
--- traps: models whose name starts with "scp" anywhere in workspace.
--- the set is filled once at load (chunked) and kept up to date through DescendantAdded
-local trapSet, trapHls = {}, {}
-
-local function isTrapName(n)
-    return string.match(string.lower(n), "^scp") ~= nil
-end
-
-task.spawn(function()
-    local n = 0
-    for _, d in ipairs(workspace:GetDescendants()) do
-        if d:IsA("Model") and isTrapName(d.Name) then trapSet[d] = true end
-        n = n + 1
-        if n % 2000 == 0 then task.wait() end
-    end
-end)
-
-connect(workspace.DescendantAdded, function(d)
-    if d:IsA("Model") and isTrapName(d.Name) then trapSet[d] = true end
-end)
-
-local function espUpdateTraps()
-    if not ESP.traps then
-        for m, hl in pairs(trapHls) do
-            pcall(function() hl:Destroy() end)
-            trapHls[m] = nil
-        end
-        return
-    end
-    for m in pairs(trapSet) do
-        if m.Parent and m:IsDescendantOf(workspace) then
-            local torso = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m.PrimaryPart
-            if torso then
-                local hl = trapHls[m]
-                if not (hl and hl.Parent) then
-                    hl = new("Highlight", {
-                        Name = "Combined_Trap_ESP",
-                        FillTransparency = 0.5,
-                        OutlineTransparency = 0,
-                    }, m)
-                    trapHls[m] = hl
-                end
-                hl.FillColor = ESPColors.traps
-                hl.OutlineColor = ESPColors.traps
-            end
-        else
-            trapSet[m] = nil
-            if trapHls[m] then
-                pcall(function() trapHls[m]:Destroy() end)
-                trapHls[m] = nil
-            end
-        end
-    end
-end
-
----------------------------------------------------------------------
--- anti-loop: pallet / vault remotes
--- on enable: fires VaultEvent for every VaultTrigger and PalletSlideEvent for every PalletPointSlide
--- in the map, then watches PalletPoint parts: when one is renamed to PalletPointSlide it fires
--- PalletSlideEvent 0.1s later. A new Map (new round) is picked up automatically.
----------------------------------------------------------------------
-local PAL = {block = false}
-local palletConns, palletWatched, palletMap = {}, {}, nil
-
-local function palletFireSlide(part)
-    pcall(function()
-        ReplicatedStorage.Remotes.Pallet.PalletSlideEvent:FireServer(part, true)
-    end)
-end
-
-local function palletFireVault(part)
-    pcall(function()
-        ReplicatedStorage.Remotes.Window.VaultEvent:FireServer(part, true)
-    end)
-end
-
-local function watchPallet(d)
-    if palletWatched[d] then return end
-    if d:IsA("BasePart") and d.Name == "PalletPoint" then
-        palletWatched[d] = d:GetPropertyChangedSignal("Name"):Connect(function()
-            if not PAL.block then return end
-            if d.Name == "PalletPointSlide" then
-                task.wait(0.1)
-                palletFireSlide(d)
-            end
-        end)
-    end
-end
-
-local function palletStop()
-    for _, c in ipairs(palletConns) do pcall(function() c:Disconnect() end) end
-    palletConns = {}
-    for d, c in pairs(palletWatched) do
-        pcall(function() c:Disconnect() end)
-        palletWatched[d] = nil
-    end
-    palletMap = nil
-end
-
-local function palletInit(map)
-    palletMap = map
-    for _, d in ipairs(map:GetDescendants()) do
-        if d.Name == "VaultTrigger" then palletFireVault(d) end
-        if d.Name == "PalletPointSlide" and d:IsA("BasePart") then palletFireSlide(d) end
-        watchPallet(d)
-    end
-    table.insert(palletConns, map.DescendantAdded:Connect(watchPallet))
-end
-
-local function palletTick()
-    if not PAL.block then return end
-    local map = workspace:FindFirstChild("Map")
-    if map and map ~= palletMap then
-        palletStop()
-        palletInit(map)
-    end
-end
-
--- recolor existing highlights (color picker drag) without rescanning the map
 local function espApplyColors()
-    espUpdatePlayers()
-    for m, hl in pairs(genHls) do
-        if hl.Parent then
-            local c = genColor(m)
-            hl.FillColor = c
-            hl.OutlineColor = c
+    for _, it in pairs(espItems) do
+        local c
+        if it.kind == "player" then
+            c = it.killer and ESPColors.killer or ESPColors.survivors
+        else
+            c = ESPColors[it.cat]
+        end
+        if c then
+            if it.hl then
+                it.hl.FillColor = c
+                it.hl.OutlineColor = c
+            end
+            it.lbl.TextColor3 = c
         end
     end
-    for _, hl in pairs(trapHls) do
-        if hl.Parent then
-            hl.FillColor = ESPColors.traps
-            hl.OutlineColor = ESPColors.traps
+end
+
+local function espIsKiller(plr)
+    local team = plr.Team
+    if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
+
+    local function check(inst)
+        for _, name in ipairs({"Killer", "IsKiller", "killer", "Role", "role", "Team", "team"}) do
+            local v = inst:GetAttribute(name)
+            if v == true and string.find(string.lower(name), "kill", 1, true) then return true end
+            if type(v) == "string" and string.find(string.lower(v), "kill", 1, true) then return true end
+        end
+        return false
+    end
+
+    if check(plr) then return true end
+    local chr = plr.Character
+    if chr then
+        if check(chr) then return true end
+        if chr:FindFirstChild("Killer") then return true end
+    end
+    return false
+end
+
+local function espRefreshPlayers()
+    local alive = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not string.find(plr.Team and string.lower(plr.Team.Name) or "", "spect", 1, true) then
+            local killer = espIsKiller(plr)
+            local want = (killer and ESP.killer) or ((not killer) and ESP.survivors)
+            local chr = plr.Character
+            local root = chr and chr:FindFirstChild("HumanoidRootPart")
+            local hum = chr and chr:FindFirstChildOfClass("Humanoid")
+            if want and chr and root and (not hum or hum.Health > 0) then
+                alive[plr] = true
+                local color = killer and ESPColors.killer or ESPColors.survivors
+                local it = espItems[plr]
+                if it and (it.chr ~= chr or it.killer ~= killer) then
+                    espRemove(plr)
+                    it = nil
+                end
+                if not it then
+                    local hl = new("Highlight", {
+                        Adornee = chr,
+                        FillColor = color,
+                        OutlineColor = color,
+                        FillTransparency = 0.65,
+                        OutlineTransparency = 0,
+                        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                    }, espFolder)
+                    local bb, lbl = espMakeTag(root, color)
+                    espItems[plr] = {
+                        kind = "player",
+                        chr = chr,
+                        killer = killer,
+                        part = root,
+                        hl = hl,
+                        bb = bb,
+                        lbl = lbl,
+                        text = plr.DisplayName .. (killer and " (KILLER)" or ""),
+                    }
+                end
+            end
+        end
+    end
+    for key, it in pairs(espItems) do
+        if it.kind == "player" and not alive[key] then
+            espRemove(key)
+        end
+    end
+end
+
+local genSet = {}
+
+local function espIsGenerator(obj)
+    return obj:IsA("Model") and string.lower(obj.Name) == "generator"
+end
+
+for _, obj in ipairs(workspace:GetDescendants()) do
+    if espIsGenerator(obj) then genSet[obj] = true end
+end
+
+connect(workspace.DescendantAdded, function(obj)
+    if espIsGenerator(obj) then genSet[obj] = true end
+end)
+
+local function espRefreshGenerators()
+    local alive = {}
+    if ESP.generators then
+        for model in pairs(genSet) do
+            if model.Parent then
+                local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    alive[model] = true
+                    local it = espItems[model]
+                    if it and it.part ~= part then
+                        espRemove(model)
+                        it = nil
+                    end
+                    if not it then
+                        local color = ESPColors.generators
+                        local hl = new("Highlight", {
+                            Adornee = model,
+                            FillColor = color,
+                            OutlineColor = color,
+                            FillTransparency = 0.65,
+                            OutlineTransparency = 0,
+                            DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                        }, espFolder)
+                        local bb, lbl = espMakeTag(part, color)
+                        espItems[model] = {
+                            kind = "object",
+                            cat = "generators",
+                            part = part,
+                            hl = hl,
+                            bb = bb,
+                            lbl = lbl,
+                            text = "Generator",
+                        }
+                    end
+                end
+            else
+                genSet[model] = nil
+            end
+        end
+    end
+    for key, it in pairs(espItems) do
+        if it.cat == "generators" and not alive[key] then
+            espRemove(key)
         end
     end
 end
 
 local function espSet(flag, v)
     ESP[flag] = v
-    pcall(espUpdatePlayers)
-    pcall(espUpdateGenerators)
-    pcall(espUpdateTraps)
+    espRefreshPlayers()
+    espRefreshGenerators()
 end
 
 local espT1, espT2 = 0, 0
 connect(RunService.Heartbeat, function(dt)
     espT1 = espT1 + dt
     espT2 = espT2 + dt
-    if espT1 >= 0.5 then
+
+    if espT1 >= 0.1 then
         espT1 = 0
-        if ESP.survivors or ESP.killer then pcall(espUpdatePlayers) end
-    end
-    if espT2 >= 1.5 then
-        espT2 = 0
-        if ESP.generators then pcall(espUpdateGenerators) end
-        if ESP.traps then pcall(espUpdateTraps) end
-        if PAL.block then task.spawn(palletTick) end
-    end
-end)
-
----------------------------------------------------------------------
--- auto skill check: put the needle on the zone (+109) and press Space
----------------------------------------------------------------------
-local SC = {
-    auto = false,
-}
-local scBusy = false
-
-connect(RunService.Heartbeat, function()
-    if not SC.auto or scBusy then return end
-    pcall(function()
-        local g = playerGui:FindFirstChild("SkillCheckPromptGui") or playerGui:FindFirstChild("SkillCheckGui", true)
-        if not g then return end
-        if g:IsA("ScreenGui") and not g.Enabled then return end
-
-        local check = g:FindFirstChild("Check") or g:FindFirstChild("Bar", true)
-        if check and check.Visible then
-            local line = check:FindFirstChild("Line") or g:FindFirstChild("Pointer", true)
-            local goal = check:FindFirstChild("Goal") or g:FindFirstChild("Zone", true)
-            if line and goal then
-                line.Rotation = goal.Rotation + 109
-                scBusy = true
-                task.spawn(function()
-                    VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-                    task.wait(0.005)
-                    VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-                    task.wait(0.05)
-                    scBusy = false
-                end)
+        local cam = workspace.CurrentCamera
+        if cam then
+            local cp = cam.CFrame.Position
+            for _, it in pairs(espItems) do
+                local part = it.part
+                if part and part.Parent then
+                    if ESP.names then
+                        it.lbl.Text = string.format("%s [%d]", it.extra and it.extra() or it.text, math.floor((cp - part.Position).Magnitude))
+                    else
+                        it.lbl.Text = ""
+                    end
+                end
             end
         end
-    end)
+    end
+
+    if espT2 >= 0.5 then
+        espT2 = 0
+        if ESP.survivors or ESP.killer then espRefreshPlayers() end
+        if ESP.generators then espRefreshGenerators() end
+    end
 end)
 
 ---------------------------------------------------------------------
--- auto trap escape: while trapped (CheckInterractable.isStruggling or character IsTrapped)
--- fires Remotes.Trap.TrapEscapeEvent(true) and presses Space; throttled to every 0.2s
+-- auto skill check (single toggle, works on PC and mobile)
 ---------------------------------------------------------------------
-local TE = {escape = false}
-local teT = 0
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
 
-connect(RunService.Heartbeat, function(dt)
-    if not TE.escape then return end
-    teT = teT + dt
-    if teT < 0.2 then return end
-    teT = 0
-    pcall(function()
-        local chr = player.Character
-        if not chr then return end
-        local ci = chr:FindFirstChild("CheckInterractable")
-        if not ci then return end
-        if ci:GetAttribute("isStruggling") == true or chr:GetAttribute("IsTrapped") == true then
-            local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-            local trap = remotes and remotes:FindFirstChild("Trap")
-            local ev = trap and trap:FindFirstChild("TrapEscapeEvent")
-            if ev then ev:FireServer(true) end
-            task.spawn(function()
-                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
-                task.wait(0.005)
-                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
-            end)
+local SC = {
+    enabled = false,
+    perfect = true, -- true = perfect (white zone), false = normal
+}
+
+local SC_CFG = {
+    guiName = "SkillCheckPromptGui",
+    guiWords = {"skillcheck", "skill", "check"},
+    needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
+    zoneWords = {"goal", "zone", "success", "target"},
+    key = Enum.KeyCode.Space,
+    genRange = 12,
+    playerRange = 12,
+    mobileLead = 0.03, -- fixed, matches reference script, no UI
+    actionPath = "Survivor-mob.Controls.action.check", -- fixed mobile button path, from reference script
+    touchId = 8822,
+}
+
+local function scMakeTiming()
+    return {
+        perfectCenter = 111,
+        perfectTol = 3.5,
+        normalCenter = 127,
+        normalTol = 3,
+        lead = 0.012,
+        extra = 0,
+    }
+end
+local SC_TIMING = scMakeTiming()
+
+local function scIsMobile()
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
+
+local function scMatch(name, words)
+    name = string.lower(name)
+    for _, w in ipairs(words) do
+        if string.find(name, w, 1, true) then return true end
+    end
+    return false
+end
+
+local function scGuiVisible(obj)
+    local p = obj
+    while p do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") and not p.Enabled then return false end
+        p = p.Parent
+    end
+    return true
+end
+
+local function scNorm(a)
+    return a % 360
+end
+
+local function scDiff(a, b)
+    return ((a - b + 180) % 360) - 180
+end
+
+-- fixed-path mobile button, same lookup pattern as the reference script's GetActionTarget
+local function scGetFixedButton()
+    local pg = player:FindFirstChild("PlayerGui")
+    local current = pg
+    for segment in string.gmatch(SC_CFG.actionPath, "[^%.]+") do
+        current = current and current:FindFirstChild(segment)
+    end
+    if current and current:IsA("GuiObject") then
+        return current
+    end
+    return nil
+end
+
+local scN, scZ, scB = nil, nil, nil
+local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
+local scT = 0
+local scPressDir, scPressGoal = 1, nil
+local scStill = 0
+
+local function scReset()
+    scN, scZ, scB = nil, nil, nil
+    scLast, scPressed, scCtx, scStill = nil, false, nil, 0
+    scT = 1
+end
+
+local function scFindAll()
+    scN, scZ, scB = nil, nil, nil
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return end
+
+    local function grab(g)
+        local check = g:FindFirstChild("Check")
+        local needle = check and check:FindFirstChild("Line")
+        local zone = check and check:FindFirstChild("Goal")
+        if not (needle and zone) then
+            needle, zone = nil, nil
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("GuiObject") then
+                    if not needle and scMatch(d.Name, SC_CFG.needleWords) then
+                        needle = d
+                    elseif not zone and scMatch(d.Name, SC_CFG.zoneWords) then
+                        zone = d
+                    end
+                end
+            end
         end
+        if needle and zone then
+            scN, scZ = needle, zone
+            scB = scGetFixedButton()
+            if not scB then
+                local firstBtn
+                for _, d in ipairs(g:GetDescendants()) do
+                    if d:IsA("TextButton") or d:IsA("ImageButton") then
+                        firstBtn = firstBtn or d
+                        if scGuiVisible(d) then
+                            scB = d
+                            break
+                        end
+                    end
+                end
+                scB = scB or firstBtn
+            end
+            return true
+        end
+        return false
+    end
+
+    local main = pg:FindFirstChild(SC_CFG.guiName)
+    if main and grab(main) then return end
+    for _, g in ipairs(pg:GetChildren()) do
+        if g ~= gui and g ~= main and g:IsA("ScreenGui") and scMatch(g.Name, SC_CFG.guiWords) then
+            if grab(g) then return end
+        end
+    end
+end
+
+local SC_IDS = {
+    generator = {"gen"},
+    heal = {"heal"},
+    trap = {"trap"},
+}
+local SC_ORDER = {"generator", "heal", "trap"}
+
+local function scCtxFromChar()
+    local chr = player.Character
+    if not chr then return nil end
+    for _, c in ipairs(chr:GetChildren()) do
+        local n = string.lower(c.Name)
+        if string.find(n, "skillcheck", 1, true) then
+            for _, kind in ipairs(SC_ORDER) do
+                if scMatch(n, SC_IDS[kind]) then return kind, c.Name end
+            end
+            return nil, c.Name
+        end
+    end
+    return nil
+end
+
+local function scCtxProximity()
+    local chr = player.Character
+    local root = chr and chr:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local pos = root.Position
+
+    local bestKind, bestDist = nil, math.huge
+    local function consider(kind, dist, range)
+        if dist <= range and dist < bestDist then
+            bestKind, bestDist = kind, dist
+        end
+    end
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and string.lower(obj.Name) == "generator" and not obj:FindFirstChildOfClass("Humanoid") then
+            local ok, cf = pcall(function() return obj:GetPivot() end)
+            if ok then consider("generator", (cf.Position - pos).Magnitude, SC_CFG.genRange) end
+        end
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not espIsKiller(plr) then
+            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if r then consider("heal", (r.Position - pos).Magnitude, SC_CFG.playerRange) end
+        end
+    end
+
+    return bestKind
+end
+
+-- PC path: VirtualInputManager first (real input), firesignal only if VIM is missing / failed. unchanged.
+local function scKeyPress()
+    local sent = false
+    if VirtualInputManager then
+        sent = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+            task.wait(0.03)
+            VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+        end)
+    end
+    if not sent and firesignal then
+        pcall(function()
+            firesignal(UserInputService.InputBegan, {
+                KeyCode = SC_CFG.key,
+                UserInputType = Enum.UserInputType.Keyboard,
+            }, false)
+        end)
+    end
+end
+
+-- mobile: screen-space center of the button, both insets applied like the reference script
+local function scButtonCenter()
+    if not (scB and scB:IsDescendantOf(game)) then return nil end
+    local p, s = scB.AbsolutePosition, scB.AbsoluteSize
+    local inset = GuiService:GetGuiInset()
+    return p.X + s.X / 2 + inset.X, p.Y + s.Y / 2 + inset.Y
+end
+
+-- fixed-path tap, matching the reference script's TriggerMobileButton (touch, no mouse fallback)
+local function scTapButton()
+    local x, y = scButtonCenter()
+    if not (x and VirtualInputManager) then return false end
+    return pcall(function()
+        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, x, y) -- 0 = Begin
+        task.wait(0.01)
+        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, x, y) -- 2 = End
     end)
-end)
+end
+
+local function scPress()
+    task.spawn(function()
+        if scIsMobile() then
+            if scTapButton() then return end
+        end
+        scKeyPress()
+    end)
+end
+
+connect(player.CharacterAdded, scReset)
+do
+    local pg0 = player:FindFirstChild("PlayerGui")
+    if pg0 then connect(pg0.ChildAdded, scReset) end
+end
+
+local function scStep(dt)
+    if not SC.enabled then
+        scLast = nil
+        scN, scZ = nil, nil
+        return
+    end
+
+    scT = scT + dt
+    local stale = (not scN) or (not scZ) or (not scN:IsDescendantOf(game)) or (not scZ:IsDescendantOf(game))
+    if (stale and scT >= 0.2) or scT >= 2 then
+        scT = 0
+        scFindAll()
+    end
+
+    if stale or not scN or not scZ or not scGuiVisible(scN) then
+        scLast, scPressed, scCtx, scStill = nil, false, nil, 0
+        return
+    end
+
+    local rot = scNorm(scN.Rotation)
+
+    if scPressed then
+        local waited = os.clock() - scPressTime
+        local step = scLast and scDiff(rot, scLast) or 0
+        local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
+        if math.abs(step) < 20 * math.max(dt, 0.001) then scStill = scStill + 1 else scStill = 0 end
+        if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2 or scStill >= 3)) or waited > 0.8 then
+            scPressed = false
+            scStill = 0
+        end
+        scLast = rot
+        return
+    end
+
+    if scLast == nil or dt <= 0 then
+        scLast = rot
+        scSeenAt = os.clock()
+        return
+    end
+
+    local vel = scDiff(rot, scLast) / dt
+    scLast = rot
+    if math.abs(vel) < 20 then return end
+
+    local ctx, rawId = scCtxFromChar()
+    if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
+        scCtx = scCtxProximity() or "any"
+    end
+    ctx = ctx or scCtx
+    if not ctx then return end
+    if ctx == "trap" then return end
+
+    local center = SC.perfect and SC_TIMING.perfectCenter or SC_TIMING.normalCenter
+    local tol = SC.perfect and SC_TIMING.perfectTol or SC_TIMING.normalTol
+    local lead = SC_TIMING.lead + (scIsMobile() and SC_CFG.mobileLead or 0)
+    local target = scZ.Rotation + center + SC_TIMING.extra
+
+    local diffNow = scDiff(rot, target)
+    local diffNext = scDiff(rot + vel * (lead + dt), target)
+
+    local dirNow = vel >= 0 and 1 or -1
+    local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
+    if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
+        scPressed = true
+        scPressTime = os.clock()
+        scPressDir = dirNow
+        scPressGoal = scZ.Rotation
+        scPress()
+    end
+end
 
 ---------------------------------------------------------------------
 -- menu window
@@ -693,7 +959,7 @@ new("UIGradient", {
 
 local page = new("ScrollingFrame", {
     Position = UDim2.fromOffset(10, 56),
-    Size = UDim2.new(1, -20, 1, -86),
+    Size = UDim2.new(1, -20, 1, -66),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
     ScrollBarThickness = 3,
@@ -710,17 +976,6 @@ new("UIPadding", {
     PaddingTop = UDim.new(0, 2),
     PaddingBottom = UDim.new(0, 6),
 }, page)
-
-new("TextLabel", {
-    BackgroundTransparency = 1,
-    Position = UDim2.new(0, 14, 1, -26),
-    Size = UDim2.new(1, -28, 0, 20),
-    Font = Enum.Font.GothamMedium,
-    TextSize = 11,
-    TextXAlignment = Enum.TextXAlignment.Left,
-    TextColor3 = THEME.dim,
-    Text = "Click key button to rebind  |  Backspace - clear  |  Esc - cancel",
-}, main)
 
 local function addSection(text)
     new("TextLabel", {
@@ -857,6 +1112,109 @@ local function addButton(text, callback)
         pcall(callback)
     end)
     return btn
+end
+
+local function addSlider(text, minV, maxV, default, step, fmt, onChange, onCommit)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 5),
+        Size = UDim2.new(1, -100, 0, 18),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local valLbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(1, -84, 0, 5),
+        Size = UDim2.fromOffset(70, 18),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextColor3 = THEME.accent2,
+        Text = "",
+    }, row)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(14, 33),
+        Size = UDim2.new(1, -28, 0, 8),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+        Active = true,
+    }, row)
+    corner(track, 4)
+
+    local fill = new("Frame", {
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = THEME.accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 4)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(16, 16),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 8)
+
+    local value = default
+
+    local function render()
+        local a = (value - minV) / (maxV - minV)
+        fill.Size = UDim2.fromScale(a, 1)
+        knob.Position = UDim2.fromScale(a, 0.5)
+        valLbl.Text = string.format(fmt, value)
+    end
+
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local a = math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+        local v = minV + a * (maxV - minV)
+        v = math.floor(v / step + 0.5) * step
+        v = math.clamp(v, minV, maxV)
+        if v ~= value then
+            value = v
+            render()
+            pcall(onChange, v)
+        end
+    end
+
+    local drag = false
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            drag = true
+            page.ScrollingEnabled = false
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if drag and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if drag and isPointer(input) then
+            drag = false
+            page.ScrollingEnabled = true
+            if onCommit then pcall(onCommit, value) end
+        end
+    end)
+
+    render()
 end
 
 ---------------------------------------------------------------------
@@ -1148,7 +1506,6 @@ end
 ---------------------------------------------------------------------
 local opened = true
 
--- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
     Size = UDim2.fromOffset(0, 0),
     BackgroundTransparency = 1,
@@ -1156,8 +1513,6 @@ local modalBtn = new("TextButton", {
     Modal = true,
 }, main)
 
--- remember mouse state at the first force and restore it on close,
--- otherwise the camera stays in Default and only rotates with RMB
 local prevMouseIcon = UserInputService.MouseIconEnabled
 local prevMouseBehavior = UserInputService.MouseBehavior
 local mouseForced = false
@@ -1170,8 +1525,6 @@ local function mouseRelease()
     end
 end
 
--- what the game tried to set while the menu was forcing the cursor (round start etc.)
--- our own forced values are Default / icon on, so anything else is the game's
 local gameBehavior, gameIcon = nil, nil
 connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
     if opened and mouseForced then
@@ -1192,7 +1545,6 @@ local function mouseRestore()
     local iconOn = prevMouseIcon
     if gameIcon ~= nil then iconOn = gameIcon end
     gameBehavior, gameIcon = nil, nil
-    -- first person lock: the game wants the cursor hidden and centered
     if player.CameraMode == Enum.CameraMode.LockFirstPerson then
         behavior = Enum.MouseBehavior.LockCenter
         iconOn = false
@@ -1206,7 +1558,7 @@ local function setOpen(v)
     if v then
         modalBtn.Modal = true
         main.Visible = true
-        tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
+        tween(scale, {Scale = menuScale}, 0.35, Enum.EasingStyle.Back)
     else
         closePicker()
         modalBtn.Modal = false
@@ -1307,17 +1659,11 @@ addToggle("Generators", false, function(v)
     espSet("generators", v)
 end, "espgens")
 
-addToggle("Traps", false, function(v)
-    espSet("traps", v)
-end, "esptraps")
-
 addSection("ESP Colors")
 
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
 addColorRow("Generators", "generators")
-addColorRow("Generators done", "generatorsdone")
-addColorRow("Traps", "traps")
 
 addButton("Reset colors", function()
     for k, v in pairs(DEFAULT_COLORS) do
@@ -1330,28 +1676,35 @@ addButton("Reset colors", function()
     saveColors()
 end)
 
+addSection("ESP Settings")
+
+addToggle("Names / distance", true, function(v)
+    ESP.names = v
+end, "espnames")
+
 addSection("Auto Skill Check")
 
-addToggle("Auto skill check", false, function(v)
-    SC.auto = v
+addToggle("Auto Skill Check", false, function(v)
+    SC.enabled = v
 end, "scauto")
 
-addToggle("Auto trap escape", false, function(v)
-    TE.escape = v
-end, "tescape")
+addToggle("Perfect (off = normal)", true, function(v)
+    SC.perfect = v
+end, "scperfect")
 
-addSection("Pallets / Windows")
-
-addToggle("Anti-loop (pallet + vault)", false, function(v)
-    PAL.block = v
-    if v then
-        task.spawn(palletTick)
-    else
-        palletStop()
-    end
-end, "palblock")
+addSlider("Timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
+    SC_TIMING.extra = v
+end)
 
 addSection("Settings")
+
+addSlider("Menu size", MENU_SCALE_MIN * 100, MENU_SCALE_MAX * 100, math.floor(menuScale * 100 + 0.5), 5, "%d%%", function() end, function(v)
+    menuScale = math.clamp(v / 100, MENU_SCALE_MIN, MENU_SCALE_MAX)
+    if opened then
+        tween(scale, {Scale = menuScale}, 0.15)
+    end
+    saveUi()
+end)
 
 addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
     setOpen(not opened)
@@ -1365,7 +1718,7 @@ connect(closeBtn.Activated, function()
     setOpen(false)
 end)
 
-tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
+tween(scale, {Scale = menuScale}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
 -- dragging (menu window)
@@ -1396,14 +1749,13 @@ connect(UserInputService.InputEnded, function(input)
     end
 end)
 
-connect(RunService.RenderStepped, function()
+connect(RunService.RenderStepped, function(dt)
     local rot = (os.clock() * 80) % 360
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
 
-    -- while the menu is open the cursor is visible and unlocked
     if opened then
-        mouseRelease() -- save game state first, then force
+        mouseRelease()
         if not UserInputService.MouseIconEnabled then
             UserInputService.MouseIconEnabled = true
         end
@@ -1411,6 +1763,8 @@ connect(RunService.RenderStepped, function()
             UserInputService.MouseBehavior = Enum.MouseBehavior.Default
         end
     end
+
+    pcall(scStep, dt)
 end)
 
 ---------------------------------------------------------------------
@@ -1418,14 +1772,13 @@ end)
 ---------------------------------------------------------------------
 env.__VDEspCleanup = function()
     saveColors()
-    SC.auto = false
-    TE.escape = false
-    PAL.block = false
-    pcall(palletStop)
-    ESP.survivors, ESP.killer, ESP.generators, ESP.traps = false, false, false, false
-    pcall(espUpdatePlayers)
-    pcall(espUpdateGenerators)
-    pcall(espUpdateTraps)
+    saveUi()
+    for k in pairs(ESP) do
+        if k ~= "names" then ESP[k] = false end
+    end
+    espClear()
+
+    SC.enabled = false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
