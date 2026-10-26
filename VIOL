@@ -525,12 +525,32 @@ pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
 end)
 
+-- log: console + the "Log" box in the menu (many executors send print() of scripts to their own console,
+-- not to F9, so the menu box is the reliable place to read it)
+local scLogLines, scLogAll, scLogLabel = {}, {}, nil
+local function scLog(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[i] = tostring((select(i, ...)))
+    end
+    local line = table.concat(parts, " ")
+    pcall(print, line)
+    table.insert(scLogAll, line)
+    if #scLogAll > 300 then table.remove(scLogAll, 1) end
+    table.insert(scLogLines, line)
+    if #scLogLines > 12 then table.remove(scLogLines, 1) end
+    if scLogLabel then
+        pcall(function() scLogLabel.Text = table.concat(scLogLines, "\n") end)
+    end
+end
+
 local SC = {
     generator = false,
     heal = false,
     genPerfect = true,   -- generators: true = perfect (white zone), false = normal
     healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
     trap = false,        -- trap release (always perfect)
+    trapSpoof = true,    -- trap: hand the game the zone angle when it reads the needle (any press = perfect)
 }
 
 -- skill check GUI:
@@ -634,6 +654,15 @@ local function scIsOutline(o)
     return false
 end
 
+-- 3 = solid bright element, 2 = bright outline only, 1 = any other visible small element, 0 = invisible
+local function scVisKind(o)
+    if scIsWhite(o) then return 3 end
+    if scIsOutline(o) then return 2 end
+    if (o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.ImageTransparency < 0.9 and o.Image ~= "" then return 1 end
+    if o.BackgroundTransparency < 0.9 then return 1 end
+    return 0
+end
+
 local scN, scZ, scB = nil, nil, nil
 local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
@@ -723,7 +752,7 @@ local function scFindZoneAngle(force)
     local obj = scZoneObj
     if not force and obj and now - scZoneScanAt < 0.4
         and obj.Parent and obj:IsDescendantOf(game) and scGuiVisible(obj)
-        and ((scZoneKind == 2 and scIsWhite(obj)) or (scZoneKind == 1 and scIsOutline(obj))) then
+        and scVisKind(obj) == scZoneKind then
         return scAngle(visCenter(obj), c), obj, scZoneKind
     end
 
@@ -732,10 +761,10 @@ local function scFindZoneAngle(force)
     local best, bestScore, bestPt, bestKind = nil, -math.huge, nil, 0
     for _, d in ipairs(root:GetDescendants()) do
         if d:IsA("GuiObject") and d ~= scN and not d:IsDescendantOf(scN) and scGuiVisible(d) then
-            local kind = scIsWhite(d) and 2 or (scIsOutline(d) and 1 or 0)
+            local kind = scVisKind(d)
             if kind > 0 then
                 local sz = math.max(d.AbsoluteSize.X, d.AbsoluteSize.Y)
-                if sz > 0 and sz <= size * 0.35 then
+                if sz > 0 and sz <= size * 0.4 then
                     local pt = visCenter(d)
                     local dist = (pt - c).Magnitude
                     if dist > size * 0.25 and dist < size * 0.75 then
@@ -755,34 +784,42 @@ local function scFindZoneAngle(force)
     return nil
 end
 
--- prints every element of the skill check gui (name / rotation / position / color) so the structure can be inspected in F9
+-- lists every element of the skill check gui (name / rotation / position / color); printed and copied to the
+-- clipboard (if the executor has setclipboard) so it can be pasted into a chat
 local function scDumpCheck(why)
     local check = scN and scN.Parent
     if not check then
-        print("[SC] dump: no skill check on screen")
+        scLog("[SC] dump: no skill check on screen")
         return
     end
     local root = scN:FindFirstAncestorOfClass("ScreenGui") or check
-    print(string.format("[SC] check dump (%s): needle rot=%.0f goal rot=%.0f", why, scN.Rotation, scZ and scZ.Rotation or 0))
+    local out = {}
+    table.insert(out, string.format("[SC] check dump (%s): needle rot=%.0f goal rot=%.0f", why, scN.Rotation, scZ and scZ.Rotation or 0))
     local n = 0
     for _, d in ipairs(root:GetDescendants()) do
         if d:IsA("GuiObject") then
             n = n + 1
             if n > 90 then
-                print("  ...")
+                table.insert(out, "  ...")
                 break
             end
             local img = d:IsA("ImageLabel") or d:IsA("ImageButton")
             local col = img and d.ImageColor3 or d.BackgroundColor3
             local tr = img and d.ImageTransparency or d.BackgroundTransparency
             local name = (string.gsub(d:GetFullName(), "^.*SkillCheckPromptGui%.", ""))
-            print(string.format("  %s [%s] vis=%s rot=%.0f pos=%.0f,%.0f size=%.0f,%.0f col=%d,%d,%d tr=%.2f outline=%s",
+            table.insert(out, string.format("  %s [%s] vis=%s rot=%.0f pos=%.0f,%.0f size=%.0f,%.0f col=%d,%d,%d tr=%.2f outline=%s kind=%d",
                 name, d.ClassName, tostring(scGuiVisible(d)), d.Rotation,
                 d.AbsolutePosition.X, d.AbsolutePosition.Y, d.AbsoluteSize.X, d.AbsoluteSize.Y,
                 math.floor(col.R * 255 + 0.5), math.floor(col.G * 255 + 0.5), math.floor(col.B * 255 + 0.5), tr,
-                tostring(scIsOutline(d))))
+                tostring(scIsOutline(d)), scVisKind(d)))
         end
     end
+    for _, line in ipairs(out) do pcall(print, line) end
+    local copied = false
+    if setclipboard then
+        copied = (pcall(setclipboard, table.concat(out, "\n")))
+    end
+    scLog("[SC] dump: " .. #out .. " lines" .. (copied and ", copied to clipboard - paste it into the chat" or " (see console)"))
 end
 
 -- skill check id in the character -> type. add a substring here if the game uses another id
@@ -864,13 +901,31 @@ end
 
 local scTrapNudge = 0       -- manual extra shift in degrees (the press point corrects itself, so this stays 0)
 local scTrapPressed = false -- we pressed for a trap check and wait for its grade
+local scLastPressSpoof = false
+local scSpoofFails = 0
+local scSpoofToggle = nil   -- menu toggle, set below
 
 local function scTrapGrade(grade)
     if scTrapPressed then
         scTrapPressed = false
-        print("[SC] trap: our press was graded", grade)
+        scLog("[SC] trap: our press was graded", grade, scLastPressSpoof and "(spoof)" or "(timing)")
+        if scLastPressSpoof then
+            if grade == "perfect" then
+                scSpoofFails = 0
+            else
+                scSpoofFails = scSpoofFails + 1
+                if scSpoofFails >= 2 then
+                    scSpoofFails = 0
+                    SC.trapSpoof = false
+                    task.spawn(function()
+                        if scSpoofToggle then scSpoofToggle.set(false) end
+                    end)
+                    scLog("[SC] trap: spoof gave no perfect twice -> switched to needle timing")
+                end
+            end
+        end
     else
-        print("[SC] trap: client graded", grade, "without our press")
+        scLog("[SC] trap: client graded", grade, "without our press")
     end
 end
 
@@ -888,11 +943,11 @@ if hookmetamethod and checkcaller and getnamecallmethod then
                         scTrapActive = true
                         scTrapActiveAt = os.clock()
                         scTrapLatchUntil = os.clock() + 6
-                        if SC.trap then print("[SC] trap escape begin") end
+                        if SC.trap then scLog("[SC] trap escape begin") end
                     elseif step == "commit" then
                         scTrapActive = false
                         scTrapLatchUntil = 0
-                        if SC.trap then print("[SC] trap escape commit") end
+                        if SC.trap then scLog("[SC] trap escape commit") end
                     end
                 elseif name == TRAP_RESULT_NAME then
                     scTrapRemote = self
@@ -901,7 +956,7 @@ if hookmetamethod and checkcaller and getnamecallmethod then
                         local grade = ...
                         if type(grade) == "string" then
                             scTrapGrade(grade)
-                            print("[SC] trap result", grade, "->", TRAP_GRADE)
+                            scLog("[SC] trap result", grade, "->", TRAP_GRADE)
                             if setnamecallmethod then setnamecallmethod(method) end
                             return oldNC(self, TRAP_GRADE, select(2, ...))
                         end
@@ -913,7 +968,30 @@ if hookmetamethod and checkcaller and getnamecallmethod then
     end)
 end
 if not scHookOk then
-    warn("[SC] trap: hookmetamethod / checkcaller / getnamecallmethod unavailable - trap uses the needle only")
+    scLog("[SC] trap: hookmetamethod / checkcaller / getnamecallmethod unavailable - trap uses the needle only")
+end
+
+-- Spoof: while a trap press is in flight, anything but pups that reads Line.Rotation gets the angle of the
+-- zone mark instead of the real needle angle, so the game grades the press perfect whatever the timing
+-- (the same way the game reads the needle for generator checks). Active for 0.35 s after each press only.
+local scSpoofAngle, scSpoofAt = nil, 0
+local scIndexOld = nil
+if hookmetamethod and checkcaller and newcclosure then
+    pcall(function()
+        scIndexOld = hookmetamethod(game, "__index", newcclosure(function(self, key)
+            if scSpoofAngle and self == scN and key == "Rotation" and scOutAlive
+                and os.clock() - scSpoofAt < 0.35 and not checkcaller() then
+                local real = scIndexOld(self, key)
+                -- keep the same "lap" as the real value, in case the game does not normalise angles
+                return scSpoofAngle + 360 * math.floor((real - scSpoofAngle) / 360 + 0.5)
+            end
+            return scIndexOld(self, key)
+        end))
+    end)
+end
+local scSpoofReady = scIndexOld ~= nil
+if not scSpoofReady then
+    scLog("[SC] trap: __index hook unavailable - spoof off, using needle timing")
 end
 
 -- trapped state: escape flow seen by the hook, or an attribute on the character / player
@@ -941,7 +1019,7 @@ local function scTrapTick()
     local quiet = now - math.max(scTrapResultAt, scTrapActiveAt)
     if quiet > TRAP_TIMEOUT and now - scTrapLastFire > TRAP_INTERVAL then
         scTrapLastFire = now
-        if scSendTrapResult() then print("[SC] trap result sent (client reported none)") end
+        if scSendTrapResult() then scLog("[SC] trap result sent (client reported none)") end
     end
 end
 
@@ -1025,7 +1103,7 @@ connect(UserInputService.InputBegan, function(input)
     local gain = math.abs(err) > 6 and 0.9 or 0.6
     scTrapOffset = math.clamp(scTrapOffset - err * gain, -6, 40)
     env.__VDTrapOffset = scTrapOffset
-    print(string.format("[SC] trap: key landed %.1f deg %s the zone centre | press point %.1f -> %.1f",
+    scLog(string.format("[SC] trap: key landed %.1f deg %s the zone centre | press point %.1f -> %.1f",
         math.abs(err), err > 0 and "after" or "before", before, scTrapOffset))
 end)
 
@@ -1078,7 +1156,7 @@ local function scStep(dt)
         end
         if math.abs(step) < 20 * math.max(dt, 0.001) then scStill = scStill + 1 else scStill = 0 end
         if zoneMoved or (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2 or scStill >= 3)) or waited > 0.8 then
-            if zoneMoved then print("[SC] trap: next check started") end
+            if zoneMoved then scLog("[SC] trap: next check started") end
             scPressed = false
             scStill = 0
             scPrevLV, scLastG = nil, nil
@@ -1142,13 +1220,32 @@ local function scStep(dt)
                 scZoneSame = scZoneSame + 1
             else
                 scZoneSame = 0
-                print(string.format("[SC] trap zone at %.0f (needle %.0f) %s: %s", za, rot,
-                    zkind == 2 and "solid" or "outline", zobj and zobj.Name or "?"))
+                scLog(string.format("[SC] trap zone at %.0f (needle %.0f) %s: %s", za, rot,
+                    ({"visible", "outline", "solid"})[zkind] or "?", zobj and zobj.Name or "?"))
             end
             scLastZone = za
             if scZoneSame < 2 then return end                  -- wait until the zone stopped moving
             if os.clock() - scPressTime < 0.2 then return end  -- never press twice in a row
             zoneNow = za
+
+            if SC.trapSpoof and scSpoofReady then
+                if os.clock() - scMoveStart < 0.15 then return end -- the check has only just started
+                scSpoofAngle, scSpoofAt = za, os.clock()
+                scLog(string.format("[SC] press trap(spoof) zone=%.0f needle=%.0f vel=%d", za, rot, math.floor(vel)))
+                scTrapPressed = true
+                scLastPressSpoof = true
+                scPressZone = za
+                scZoneObj = nil
+                scEvalPending = nil
+                scPressed = true
+                scPressTime = os.clock()
+                scPressDir = vel >= 0 and 1 or -1
+                scPressGoal = scZ.Rotation
+                scPressSrcFn, scPressSrcV = nil, nil
+                scPress()
+                return
+            end
+
             target = za + dirSign * (scTrapOffset + scTrapNudge)
             tag = "trap(zone)"
         elseif scZoneEverFound or os.clock() - scMoveStart < 1.0 then
@@ -1156,7 +1253,7 @@ local function scStep(dt)
             -- so the structure can be read in F9 (no silent stall)
             if os.clock() - scMoveStart > 0.8 and not scNoZoneDumped then
                 scNoZoneDumped = true
-                warn("[SC] trap: zone mark not found for this check - dump below")
+                scLog("[SC] trap: zone mark not found for this check - dump below")
                 scDumpCheck("zone mark not found")
             end
             return
@@ -1165,7 +1262,7 @@ local function scStep(dt)
             tag = "trap(fixed)"
             if not scTrapWarned then
                 scTrapWarned = true
-                warn("[SC] trap: zone mark not found - using the fixed point (only right for the first check)")
+                scLog("[SC] trap: zone mark not found - using the fixed point (only right for the first check)")
                 scDumpCheck("zone mark not found")
             end
         end
@@ -1188,11 +1285,12 @@ local function scStep(dt)
     local dirNow = curVel >= 0 and 1 or -1
     local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
-        print("[SC] press", tag, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
+        scLog("[SC] press", tag, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
             "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel),
             ctx == "trap" and ("offset=" .. string.format("%.1f", scTrapOffset)) or "")
         if ctx == "trap" then
             scTrapPressed = true
+            scLastPressSpoof = false
             scPressZone = zoneNow
             scZoneObj = nil -- look for the zone mark again after the press
             -- let the Space listener measure how far from the zone centre the key really landed
@@ -1965,12 +2063,44 @@ addToggle("Trap release", false, function(v)
     SC.trap = v
 end, "sctrap")
 
+scSpoofToggle = addToggle("Trap: spoof needle angle", true, function(v)
+    SC.trapSpoof = v
+end, "sctrapspoof")
+
 addButton("Dump skill check GUI (3s delay, F9)", function()
-    print("[SC] dump in 3 seconds - get a skill check on screen")
+    scLog("[SC] dump in 3 seconds - get a skill check on screen")
     task.delay(3, function()
         scFindAll()
         scDumpCheck("manual")
     end)
+end)
+
+addSection("Log")
+
+local logBox = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 170),
+    BackgroundColor3 = THEME.item,
+    BorderSizePixel = 0,
+    Font = Enum.Font.Code,
+    TextSize = 11,
+    TextColor3 = THEME.dim,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = true,
+    Text = "",
+    LayoutOrder = nextOrder(),
+}, page)
+corner(logBox, 8)
+new("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingTop = UDim.new(0, 6), PaddingRight = UDim.new(0, 8)}, logBox)
+scLogLabel = logBox
+
+addButton("Copy log to clipboard", function()
+    if setclipboard then
+        pcall(setclipboard, table.concat(scLogAll, "\n"))
+        scLog("[SC] log copied to clipboard")
+    else
+        scLog("[SC] setclipboard is not available in this executor")
+    end
 end)
 
 addSection("Settings")
