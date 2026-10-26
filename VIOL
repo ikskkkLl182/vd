@@ -1,11 +1,12 @@
 -- pups - Violence District ESP + auto skill check (generators / healing)
 -- floating icon (mobile), K key (PC), ESP color picker
+-- mobile skill check uses exact GUI path + GuiInset offset + SendTouchEvent
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
-local ContextActionService = game:GetService("ContextActionService")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -544,6 +545,9 @@ local SC_CFG = {
     ghExtra = 0,
     genRange = 12,
     playerRange = 12,
+    -- mobile press target (exact path from working mobile scripts)
+    actionPath = "Survivor-mob.Controls.action.check",
+    touchId = 8822,
 }
 
 local function scMatch(name, words)
@@ -608,7 +612,7 @@ local function scFindAll()
         if needle and zone then
             scN, scZ = needle, zone
 
-            -- Приоритет 1: кнопка, внутри которой находится сам чек
+            -- priority 1: button that contains the check
             local target = nil
             local p = check or needle
             while p and p ~= g do
@@ -619,7 +623,7 @@ local function scFindAll()
                 p = p.Parent
             end
 
-            -- Приоритет 2: любая видимая кнопка в этом же GUI
+            -- priority 2: largest visible button in the same GUI
             if not target then
                 local bestScore = -1
                 for _, d in ipairs(g:GetDescendants()) do
@@ -700,33 +704,40 @@ local function scCtxProximity()
     return bestKind
 end
 
--- ИСПРАВЛЕННЫЙ МОБИЛЬНЫЙ ВВОД
+-- Walk the exact path used by the working mobile scripts:
+--   PlayerGui["Survivor-mob"].Controls.action.check
+local function scGetActionTarget()
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+    local current = pg
+    for segment in string.gmatch(SC_CFG.actionPath, "[^%.]+") do
+        current = current and current:FindFirstChild(segment)
+        if not current then return nil end
+    end
+    return current
+end
+
+-- Mobile press: exact method from working scripts
+-- uses the real GUI button path + GuiInset offset + SendTouchEvent
 local function scPressMobile()
-    -- 1. ContextActionService — основной метод для Violence District (по исходникам рабочих скриптов)
-    local casOk = pcall(function()
-        ContextActionService:CallFunction("Grab", Enum.UserInputState.Begin, game)
-    end)
-    if casOk then
-        -- Если действие "Grab" привязано и сработало, дальше можно не идти
+    local b = scGetActionTarget()
+    if b and b:IsA("GuiObject") then
+        local p, s, inset = b.AbsolutePosition, b.AbsoluteSize, GuiService:GetGuiInset()
+        local cx = p.X + (s.X / 2) + inset.X
+        local cy = p.Y + (s.Y / 2) + inset.Y
+        if VirtualInputManager then
+            pcall(function()
+                VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, cx, cy)
+                task.wait(0.01)
+                VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, cx, cy)
+            end)
+        end
         return
     end
 
-    -- 2. Получаем кнопку через ContextActionService и тапаем по ней
-    local casButton = nil
-    pcall(function()
-        casButton = ContextActionService:GetButton("Grab")
-    end)
-
+    -- Fallback: use whatever button / zone our generic finder picked up
     local pos = nil
-    if casButton and casButton.Visible then
-        local ok, p = pcall(function()
-            return casButton.AbsolutePosition + casButton.AbsoluteSize / 2
-        end)
-        if ok and p then pos = p end
-    end
-
-    -- Если кнопку через CAS не нашли, пробуем найти через наш поиск (scB) или по зоне (scZ)
-    if not pos and scB then
+    if scB then
         local ok, p = pcall(function()
             return scB.AbsolutePosition + scB.AbsoluteSize / 2
         end)
@@ -738,19 +749,16 @@ local function scPressMobile()
         end)
         if ok and p then pos = p end
     end
-
     if not pos then return end
 
-    -- 3. Корректный SendTouchEvent (сигнатура: touchId, state, x, y)
     if VirtualInputManager then
         pcall(function()
-            VirtualInputManager:SendTouchEvent(1, 0, pos.X, pos.Y) -- 0 = Begin
-            task.wait(0.05)
-            VirtualInputManager:SendTouchEvent(1, 2, pos.X, pos.Y) -- 2 = End
+            VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, pos.X, pos.Y)
+            task.wait(0.01)
+            VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, pos.X, pos.Y)
         end)
     end
 
-    -- 4. Дополнительно: firesignal для совместимости с разными экзекьюторами
     if firesignal then
         local beginInput = {
             UserInputType = Enum.UserInputType.Touch,
@@ -769,7 +777,6 @@ local function scPressMobile()
         end
         pcall(function() firesignal(UserInputService.InputBegan, beginInput, false) end)
         pcall(function() firesignal(UserInputService.InputEnded, endInput, false) end)
-        pcall(function() firesignal(UserInputService.TouchTap, pos, Enum.UserInputType.Touch) end)
     end
 end
 
@@ -894,7 +901,7 @@ local function scStep(dt)
 end
 
 ---------------------------------------------------------------------
--- menu window (base size reduced 380x470 -> 340x400)
+-- menu window (reduced base size, adjustable)
 ---------------------------------------------------------------------
 local main = new("Frame", {
     Name = "Main",
