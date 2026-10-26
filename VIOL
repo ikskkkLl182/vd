@@ -329,7 +329,6 @@ local function espMakeTag(part, color)
     return bb, lbl
 end
 
--- apply current colors to all existing ESP objects
 local function espApplyColors()
     for _, it in pairs(espItems) do
         local c
@@ -348,7 +347,6 @@ local function espApplyColors()
     end
 end
 
--- who is the killer: team name, attributes, or a "Killer" object in the character
 local function espIsKiller(plr)
     local team = plr.Team
     if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
@@ -419,7 +417,6 @@ local function espRefreshPlayers()
     end
 end
 
--- generators: models named "Generator" anywhere in workspace (set is kept up to date via DescendantAdded)
 local genSet = {}
 
 local function espIsGenerator(obj)
@@ -528,15 +525,10 @@ end)
 local SC = {
     generator = false,
     heal = false,
-    genPerfect = true,   -- generators: true = perfect (white zone), false = normal
-    healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
+    genPerfect = true,
+    healPerfect = true,
 }
 
--- skill check GUI:
---   PlayerGui.SkillCheckPromptGui.Check.Line - needle
---   PlayerGui.SkillCheckPromptGui.Check.Goal - zone
---   perfect: Line.Rotation = Goal.Rotation + 104..114
---   normal : Line.Rotation = Goal.Rotation + 115 and beyond
 local SC_CFG = {
     guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
@@ -615,7 +607,7 @@ local function scFindAll()
         if needle and zone then
             scN, scZ = needle, zone
 
-            -- Preferred: the Check / needle / zone is inside a button -> that's the press target
+            -- Приоритет 1: кнопка, внутри которой находится сам чек
             local target = nil
             local p = check or needle
             while p and p ~= g do
@@ -626,7 +618,7 @@ local function scFindAll()
                 p = p.Parent
             end
 
-            -- Fallback: pick the largest visible button in the whole GUI
+            -- Приоритет 2: любая видимая кнопка в этом же GUI
             if not target then
                 local bestScore = -1
                 for _, d in ipairs(g:GetDescendants()) do
@@ -641,7 +633,6 @@ local function scFindAll()
                 end
             end
             scB = target
-
             return true
         end
         return false
@@ -708,26 +699,7 @@ local function scCtxProximity()
     return bestKind
 end
 
--- fire every possible press signal at a touch position (mobile)
-local function scFireTouch(pos)
-    if not firesignal then return end
-    local beginInput = {
-        UserInputType = Enum.UserInputType.Touch,
-        Position = Vector3.new(pos.X, pos.Y, 0),
-        InputState = Enum.UserInputState.Begin,
-    }
-    local endInput = {
-        UserInputType = Enum.UserInputType.Touch,
-        Position = Vector3.new(pos.X, pos.Y, 0),
-        InputState = Enum.UserInputState.End,
-    }
-    pcall(function() firesignal(UserInputService.InputBegan, beginInput, false) end)
-    pcall(function() firesignal(UserInputService.InputChanged, beginInput, false) end)
-    pcall(function() firesignal(UserInputService.InputEnded, endInput, false) end)
-    pcall(function() firesignal(UserInputService.TouchTap, Vector2.new(pos.X, pos.Y), Enum.UserInputType.Touch) end)
-    pcall(function() firesignal(UserInputService.TouchTapInWorld, Vector3.new(pos.X, pos.Y, 0), false) end)
-end
-
+-- МОБИЛЬНЫЙ ВВОД: правильная эмуляция Touch
 local function scPressMobile()
     local pos = nil
     if scB then
@@ -736,41 +708,51 @@ local function scPressMobile()
         end)
         if ok and p then pos = p end
     end
-    -- fallback to zone position if no button found
     if not pos and scZ then
         local ok, p = pcall(function()
             return scZ.AbsolutePosition + scZ.AbsoluteSize / 2
         end)
         if ok and p then pos = p end
     end
+    if not pos then return end
 
-    -- 1. button signal fires
-    if scB and firesignal then
+    -- 1. Пытаемся отправить правильное событие Touch через VirtualInputManager
+    if VirtualInputManager then
+        pcall(function()
+            -- SendTouchEvent(true, x, y, game)
+            VirtualInputManager:SendTouchEvent(true, pos.X, pos.Y, game)
+            task.wait(0.05)
+            VirtualInputManager:SendTouchEvent(false, pos.X, pos.Y, game)
+        end)
+    end
+
+    -- 2. Если есть firesignal, дублируем Touch-события на кнопку и в UserInputService
+    if firesignal then
         local beginInput = {
             UserInputType = Enum.UserInputType.Touch,
-            Position = pos and Vector3.new(pos.X, pos.Y, 0) or Vector3.zero,
+            Position = Vector3.new(pos.X, pos.Y, 0),
             InputState = Enum.UserInputState.Begin,
         }
         local endInput = {
             UserInputType = Enum.UserInputType.Touch,
-            Position = pos and Vector3.new(pos.X, pos.Y, 0) or Vector3.zero,
+            Position = Vector3.new(pos.X, pos.Y, 0),
             InputState = Enum.UserInputState.End,
         }
-        pcall(function() firesignal(scB.InputBegan, beginInput, false) end)
-        pcall(function() firesignal(scB.InputEnded, endInput, false) end)
-        pcall(function() firesignal(scB.MouseButton1Down) end)
-        pcall(function() firesignal(scB.MouseButton1Up) end)
-        pcall(function() firesignal(scB.MouseButton1Click) end)
-        pcall(function() firesignal(scB.Activated) end)
+        if scB then
+            pcall(function() firesignal(scB.InputBegan, beginInput, false) end)
+            pcall(function() firesignal(scB.InputEnded, endInput, false) end)
+            pcall(function() firesignal(scB.MouseButton1Down) end)
+            pcall(function() firesignal(scB.MouseButton1Up) end)
+            pcall(function() firesignal(scB.MouseButton1Click) end)
+            pcall(function() firesignal(scB.Activated) end)
+        end
+        pcall(function() firesignal(UserInputService.InputBegan, beginInput, false) end)
+        pcall(function() firesignal(UserInputService.InputEnded, endInput, false) end)
+        pcall(function() firesignal(UserInputService.TouchTap, pos, Enum.UserInputType.Touch) end)
     end
 
-    -- 2. UserInputService touch signals at button / zone position
-    if pos then
-        scFireTouch(pos)
-    end
-
-    -- 3. VirtualInputManager mouse simulates tap on the button (works cross-platform)
-    if VirtualInputManager and pos then
+    -- 3. Фолбэк: клик мышью (на некоторых мобильных экзекьюторах работает)
+    if VirtualInputManager then
         pcall(function()
             VirtualInputManager:SendMouseMoveEvent(pos.X, pos.Y, game)
             task.wait(0.01)
@@ -1154,7 +1136,6 @@ local function addButton(text, callback)
     return btn
 end
 
--- generic slider row (used for menu size)
 local function addSlider(text, minV, maxV, defaultV, callback)
     local row = new("Frame", {
         Size = UDim2.new(1, 0, 0, 54),
@@ -1527,9 +1508,8 @@ end
 -- open / close menu
 ---------------------------------------------------------------------
 local opened = true
-local menuSize = 0.9   -- user-adjustable via slider
+local menuSize = 0.9
 
--- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
     Size = UDim2.fromOffset(0, 0),
     BackgroundTransparency = 1,
