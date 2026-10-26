@@ -213,6 +213,7 @@ local COLOR_FILE = "vd_esp_colors.json"
 local DEFAULT_COLORS = {
     survivors = Color3.fromRGB(80, 255, 130),
     killer = Color3.fromRGB(255, 60, 60),
+    generators = Color3.fromRGB(255, 220, 60),
 }
 
 local ESPColors = {}
@@ -285,6 +286,7 @@ local espFolder = new("Folder", {Name = "ESP"}, gui)
 local ESP = {
     survivors = false,
     killer = false,
+    generators = false,
     names = true,
 }
 
@@ -417,9 +419,72 @@ local function espRefreshPlayers()
     end
 end
 
+-- generators: models named "Generator" anywhere in workspace (set is kept up to date via DescendantAdded)
+local genSet = {}
+
+local function espIsGenerator(obj)
+    return obj:IsA("Model") and string.lower(obj.Name) == "generator"
+end
+
+for _, obj in ipairs(workspace:GetDescendants()) do
+    if espIsGenerator(obj) then genSet[obj] = true end
+end
+
+connect(workspace.DescendantAdded, function(obj)
+    if espIsGenerator(obj) then genSet[obj] = true end
+end)
+
+local function espRefreshGenerators()
+    local alive = {}
+    if ESP.generators then
+        for model in pairs(genSet) do
+            if model.Parent then
+                local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    alive[model] = true
+                    local it = espItems[model]
+                    if it and it.part ~= part then
+                        espRemove(model)
+                        it = nil
+                    end
+                    if not it then
+                        local color = ESPColors.generators
+                        local hl = new("Highlight", {
+                            Adornee = model,
+                            FillColor = color,
+                            OutlineColor = color,
+                            FillTransparency = 0.65,
+                            OutlineTransparency = 0,
+                            DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                        }, espFolder)
+                        local bb, lbl = espMakeTag(part, color)
+                        espItems[model] = {
+                            kind = "object",
+                            cat = "generators",
+                            part = part,
+                            hl = hl,
+                            bb = bb,
+                            lbl = lbl,
+                            text = "Generator",
+                        }
+                    end
+                end
+            else
+                genSet[model] = nil
+            end
+        end
+    end
+    for key, it in pairs(espItems) do
+        if it.cat == "generators" and not alive[key] then
+            espRemove(key)
+        end
+    end
+end
+
 local function espSet(flag, v)
     ESP[flag] = v
     espRefreshPlayers()
+    espRefreshGenerators()
 end
 
 local espT1, espT2 = 0, 0
@@ -448,6 +513,7 @@ connect(RunService.Heartbeat, function(dt)
     if espT2 >= 0.5 then
         espT2 = 0
         if ESP.survivors or ESP.killer then espRefreshPlayers() end
+        if ESP.generators then espRefreshGenerators() end
     end
 end)
 
@@ -1453,10 +1519,17 @@ addToggle("Killer", false, function(v)
     espSet("killer", v)
 end, "espkiller")
 
+addSection("World")
+
+addToggle("Generators", false, function(v)
+    espSet("generators", v)
+end, "espgens")
+
 addSection("ESP Colors")
 
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
+addColorRow("Generators", "generators")
 
 addButton("Reset colors", function()
     for k, v in pairs(DEFAULT_COLORS) do
