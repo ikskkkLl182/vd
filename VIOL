@@ -543,12 +543,12 @@ local SC_CFG = {
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
-    perfectTol = 3.5,      -- tolerance for perfect hit
-    normalCenter = 127,    -- press point for normal hit (further than the white zone)
+    perfectCenter = 111,
+    perfectTol = 3.5,
+    normalCenter = 127,
     normalTol = 3,
-    lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
-    ghExtra = 0,           -- extra target shift (degrees). plus = press later
+    lead = 0.012,
+    ghExtra = 0,
     genRange = 12,
     playerRange = 12,
 }
@@ -575,7 +575,6 @@ local function scNorm(a)
     return a % 360
 end
 
--- shortest angle difference a - b in [-180, 180)
 local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
 end
@@ -589,7 +588,7 @@ local scStill = 0
 local function scReset()
     scN, scZ, scB = nil, nil, nil
     scLast, scPressed, scCtx, scStill = nil, false, nil, 0
-    scT = 1 -- search again right away
+    scT = 1
 end
 
 local function scFindAll()
@@ -615,12 +614,34 @@ local function scFindAll()
         end
         if needle and zone then
             scN, scZ = needle, zone
-            for _, d in ipairs(g:GetDescendants()) do
-                if d:IsA("TextButton") or d:IsA("ImageButton") then
-                    scB = d
+
+            -- Preferred: the Check / needle / zone is inside a button -> that's the press target
+            local target = nil
+            local p = check or needle
+            while p and p ~= g do
+                if p:IsA("TextButton") or p:IsA("ImageButton") then
+                    target = p
                     break
                 end
+                p = p.Parent
             end
+
+            -- Fallback: pick the largest visible button in the whole GUI
+            if not target then
+                local bestScore = -1
+                for _, d in ipairs(g:GetDescendants()) do
+                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
+                        local sz = d.AbsoluteSize
+                        local score = sz.X * sz.Y
+                        if score > bestScore then
+                            target = d
+                            bestScore = score
+                        end
+                    end
+                end
+            end
+            scB = target
+
             return true
         end
         return false
@@ -635,8 +656,6 @@ local function scFindAll()
     end
 end
 
--- skill check id in the character -> type. add a substring here if the game uses another id.
--- "trap" is only used to recognise trap checks so they are left alone.
 local SC_IDS = {
     generator = {"gen"},
     heal = {"heal"},
@@ -659,7 +678,6 @@ local function scCtxFromChar()
     return nil
 end
 
--- fallback: nearest object
 local function scCtxProximity()
     local chr = player.Character
     local root = chr and chr:FindFirstChild("HumanoidRootPart")
@@ -690,29 +708,111 @@ local function scCtxProximity()
     return bestKind
 end
 
--- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
+-- fire every possible press signal at a touch position (mobile)
+local function scFireTouch(pos)
+    if not firesignal then return end
+    local beginInput = {
+        UserInputType = Enum.UserInputType.Touch,
+        Position = Vector3.new(pos.X, pos.Y, 0),
+        InputState = Enum.UserInputState.Begin,
+    }
+    local endInput = {
+        UserInputType = Enum.UserInputType.Touch,
+        Position = Vector3.new(pos.X, pos.Y, 0),
+        InputState = Enum.UserInputState.End,
+    }
+    pcall(function() firesignal(UserInputService.InputBegan, beginInput, false) end)
+    pcall(function() firesignal(UserInputService.InputChanged, beginInput, false) end)
+    pcall(function() firesignal(UserInputService.InputEnded, endInput, false) end)
+    pcall(function() firesignal(UserInputService.TouchTap, Vector2.new(pos.X, pos.Y), Enum.UserInputType.Touch) end)
+    pcall(function() firesignal(UserInputService.TouchTapInWorld, Vector3.new(pos.X, pos.Y, 0), false) end)
+end
+
+local function scPressMobile()
+    local pos = nil
+    if scB then
+        local ok, p = pcall(function()
+            return scB.AbsolutePosition + scB.AbsoluteSize / 2
+        end)
+        if ok and p then pos = p end
+    end
+    -- fallback to zone position if no button found
+    if not pos and scZ then
+        local ok, p = pcall(function()
+            return scZ.AbsolutePosition + scZ.AbsoluteSize / 2
+        end)
+        if ok and p then pos = p end
+    end
+
+    -- 1. button signal fires
+    if scB and firesignal then
+        local beginInput = {
+            UserInputType = Enum.UserInputType.Touch,
+            Position = pos and Vector3.new(pos.X, pos.Y, 0) or Vector3.zero,
+            InputState = Enum.UserInputState.Begin,
+        }
+        local endInput = {
+            UserInputType = Enum.UserInputType.Touch,
+            Position = pos and Vector3.new(pos.X, pos.Y, 0) or Vector3.zero,
+            InputState = Enum.UserInputState.End,
+        }
+        pcall(function() firesignal(scB.InputBegan, beginInput, false) end)
+        pcall(function() firesignal(scB.InputEnded, endInput, false) end)
+        pcall(function() firesignal(scB.MouseButton1Down) end)
+        pcall(function() firesignal(scB.MouseButton1Up) end)
+        pcall(function() firesignal(scB.MouseButton1Click) end)
+        pcall(function() firesignal(scB.Activated) end)
+    end
+
+    -- 2. UserInputService touch signals at button / zone position
+    if pos then
+        scFireTouch(pos)
+    end
+
+    -- 3. VirtualInputManager mouse simulates tap on the button (works cross-platform)
+    if VirtualInputManager and pos then
+        pcall(function()
+            VirtualInputManager:SendMouseMoveEvent(pos.X, pos.Y, game)
+            task.wait(0.01)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
+            task.wait(0.02)
+            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
+        end)
+    end
+end
+
+local function scPressKeyboard()
+    local sent = false
+    if VirtualInputManager then
+        sent = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+            task.wait(0.03)
+            VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+        end)
+    end
+    if not sent and firesignal then
+        pcall(function()
+            firesignal(UserInputService.InputBegan, {
+                KeyCode = SC_CFG.key,
+                UserInputType = Enum.UserInputType.Keyboard,
+            }, false)
+        end)
+        pcall(function()
+            firesignal(UserInputService.InputEnded, {
+                KeyCode = SC_CFG.key,
+                UserInputType = Enum.UserInputType.Keyboard,
+            }, false)
+        end)
+    end
+end
+
 local function scPress()
     task.spawn(function()
-        local sent = false
-        if VirtualInputManager then
-            sent = pcall(function()
-                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
-                task.wait(0.03)
-                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
-            end)
+        if UserInputService.KeyboardEnabled then
+            scPressKeyboard()
         end
-        if not sent and firesignal then
-            pcall(function()
-                firesignal(UserInputService.InputBegan, {
-                    KeyCode = SC_CFG.key,
-                    UserInputType = Enum.UserInputType.Keyboard,
-                }, false)
-            end)
-        end
-        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
-            pcall(function() firesignal(scB.MouseButton1Down) end)
-            pcall(function() firesignal(scB.MouseButton1Click) end)
-            pcall(function() firesignal(scB.Activated) end)
+        if UserInputService.TouchEnabled then
+            scPressMobile()
         end
     end)
 end
@@ -745,7 +845,6 @@ local function scStep(dt)
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
-        -- next skill check in a chain: the zone moved, or the needle jumped / went back / stopped, or timeout
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
         local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
@@ -766,9 +865,8 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then return end -- needle is not moving yet
+    if math.abs(vel) < 20 then return end
 
-    -- which skill check: character id first, then the nearest object
     local ctx, rawId = scCtxFromChar()
     if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
         scCtx = scCtxProximity() or "any"
@@ -792,7 +890,6 @@ local function scStep(dt)
     local diffNow = scDiff(rot, target)
     local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
 
-    -- press when the needle crosses the target on the next frame or is already inside tolerance
     local dirNow = vel >= 0 and 1 or -1
     local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
@@ -805,11 +902,11 @@ local function scStep(dt)
 end
 
 ---------------------------------------------------------------------
--- menu window
+-- menu window (base size reduced 380x470 -> 340x400)
 ---------------------------------------------------------------------
 local main = new("Frame", {
     Name = "Main",
-    Size = UDim2.fromOffset(380, 470),
+    Size = UDim2.fromOffset(340, 400),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = THEME.bg,
@@ -1057,6 +1154,91 @@ local function addButton(text, callback)
     return btn
 end
 
+-- generic slider row (used for menu size)
+local function addSlider(text, minV, maxV, defaultV, callback)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 54),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    local lbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 6),
+        Size = UDim2.new(1, -28, 0, 18),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = string.format("%s: %.2f", text, defaultV),
+    }, row)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(14, 32),
+        Size = UDim2.new(1, -28, 0, 8),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+        Active = true,
+    }, row)
+    corner(track, 4)
+
+    local fill = new("Frame", {
+        Size = UDim2.new((defaultV - minV) / (maxV - minV), 0, 1, 0),
+        BackgroundColor3 = THEME.accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 4)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(14, 14),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new((defaultV - minV) / (maxV - minV), 0, 0.5, 0),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 7)
+
+    local value = defaultV
+    local dragging = false
+
+    local function setV(v)
+        value = math.clamp(v, minV, maxV)
+        local t = (value - minV) / (maxV - minV)
+        fill.Size = UDim2.new(t, 0, 1, 0)
+        knob.Position = UDim2.new(t, 0, 0.5, 0)
+        lbl.Text = string.format("%s: %.2f", text, value)
+        pcall(callback, value)
+    end
+
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local v = minV + math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1) * (maxV - minV)
+        setV(v)
+    end
+
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            dragging = true
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if isPointer(input) then
+            dragging = false
+        end
+    end)
+
+    return {set = setV, get = function() return value end}
+end
+
 ---------------------------------------------------------------------
 -- color picker (HSV sliders popup)
 ---------------------------------------------------------------------
@@ -1064,7 +1246,7 @@ local colorSwatches = {}
 
 local picker = new("Frame", {
     Name = "ColorPicker",
-    Size = UDim2.fromOffset(330, 300),
+    Size = UDim2.fromOffset(320, 300),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = THEME.panel,
@@ -1345,6 +1527,7 @@ end
 -- open / close menu
 ---------------------------------------------------------------------
 local opened = true
+local menuSize = 0.9   -- user-adjustable via slider
 
 -- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
@@ -1354,8 +1537,6 @@ local modalBtn = new("TextButton", {
     Modal = true,
 }, main)
 
--- remember mouse state at the first force and restore it on close,
--- otherwise the camera stays in Default and only rotates with RMB
 local prevMouseIcon = UserInputService.MouseIconEnabled
 local prevMouseBehavior = UserInputService.MouseBehavior
 local mouseForced = false
@@ -1368,8 +1549,6 @@ local function mouseRelease()
     end
 end
 
--- what the game tried to set while the menu was forcing the cursor (round start etc.)
--- our own forced values are Default / icon on, so anything else is the game's
 local gameBehavior, gameIcon = nil, nil
 connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
     if opened and mouseForced then
@@ -1390,7 +1569,6 @@ local function mouseRestore()
     local iconOn = prevMouseIcon
     if gameIcon ~= nil then iconOn = gameIcon end
     gameBehavior, gameIcon = nil, nil
-    -- first person lock: the game wants the cursor hidden and centered
     if player.CameraMode == Enum.CameraMode.LockFirstPerson then
         behavior = Enum.MouseBehavior.LockCenter
         iconOn = false
@@ -1404,7 +1582,7 @@ local function setOpen(v)
     if v then
         modalBtn.Modal = true
         main.Visible = true
-        tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
+        tween(scale, {Scale = menuSize}, 0.35, Enum.EasingStyle.Back)
     else
         closePicker()
         modalBtn.Modal = false
@@ -1548,6 +1726,13 @@ end, "schealperfect")
 
 addSection("Settings")
 
+addSlider("Menu size", 0.6, 1.5, menuSize, function(v)
+    menuSize = v
+    if opened then
+        tween(scale, {Scale = v}, 0.1)
+    end
+end)
+
 addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
     setOpen(not opened)
 end)
@@ -1560,7 +1745,7 @@ connect(closeBtn.Activated, function()
     setOpen(false)
 end)
 
-tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
+tween(scale, {Scale = menuSize}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
 -- dragging (menu window)
@@ -1596,9 +1781,8 @@ connect(RunService.RenderStepped, function(dt)
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
 
-    -- while the menu is open the cursor is visible and unlocked
     if opened then
-        mouseRelease() -- save game state first, then force
+        mouseRelease()
         if not UserInputService.MouseIconEnabled then
             UserInputService.MouseIconEnabled = true
         end
