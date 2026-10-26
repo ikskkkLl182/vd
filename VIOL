@@ -1692,10 +1692,6 @@ addToggle("Perfect (off = normal)", true, function(v)
     SC.perfect = v
 end, "scperfect")
 
-addSlider("Timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
-    SC_TIMING.extra = v
-end)
-
 addSection("Settings")
 
 addSlider("Menu size", MENU_SCALE_MIN * 100, MENU_SCALE_MAX * 100, math.floor(menuScale * 100 + 0.5), 5, "%d%%", function() end, function(v)
