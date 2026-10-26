@@ -1,5 +1,5 @@
 -- pups - Violence District ESP + auto skill check (generators / healing)
--- floating icon (mobile), K key (PC), ESP color picker
+-- floating icon (mobile), K key (PC), ESP color picker, Mobile Fit & Resizable Menu
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -329,7 +329,6 @@ local function espMakeTag(part, color)
     return bb, lbl
 end
 
--- apply current colors to all existing ESP objects
 local function espApplyColors()
     for _, it in pairs(espItems) do
         local c
@@ -348,7 +347,6 @@ local function espApplyColors()
     end
 end
 
--- who is the killer: team name, attributes, or a "Killer" object in the character
 local function espIsKiller(plr)
     local team = plr.Team
     if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
@@ -419,7 +417,6 @@ local function espRefreshPlayers()
     end
 end
 
--- generators: models named "Generator" anywhere in workspace (set is kept up to date via DescendantAdded)
 local genSet = {}
 
 local function espIsGenerator(obj)
@@ -518,7 +515,7 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check (generators / healing)
+-- auto skill check (generators / healing) - С фиксом под мобильные
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
@@ -528,27 +525,22 @@ end)
 local SC = {
     generator = false,
     heal = false,
-    genPerfect = true,   -- generators: true = perfect (white zone), false = normal
-    healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
+    genPerfect = true,   
+    healPerfect = true,  
 }
 
--- skill check GUI:
---   PlayerGui.SkillCheckPromptGui.Check.Line - needle
---   PlayerGui.SkillCheckPromptGui.Check.Goal - zone
---   perfect: Line.Rotation = Goal.Rotation + 104..114
---   normal : Line.Rotation = Goal.Rotation + 115 and beyond
 local SC_CFG = {
     guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
-    perfectTol = 3.5,      -- tolerance for perfect hit
-    normalCenter = 127,    -- press point for normal hit (further than the white zone)
+    perfectCenter = 111,   
+    perfectTol = 3.5,      
+    normalCenter = 127,    
     normalTol = 3,
-    lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
-    ghExtra = 0,           -- extra target shift (degrees). plus = press later
+    lead = 0.012,          
+    ghExtra = 0,           
     genRange = 12,
     playerRange = 12,
 }
@@ -575,7 +567,6 @@ local function scNorm(a)
     return a % 360
 end
 
--- shortest angle difference a - b in [-180, 180)
 local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
 end
@@ -589,7 +580,7 @@ local scStill = 0
 local function scReset()
     scN, scZ, scB = nil, nil, nil
     scLast, scPressed, scCtx, scStill = nil, false, nil, 0
-    scT = 1 -- search again right away
+    scT = 1 
 end
 
 local function scFindAll()
@@ -626,17 +617,15 @@ local function scFindAll()
         return false
     end
 
-    local main = pg:FindFirstChild(SC_CFG.guiName)
-    if main and grab(main) then return end
+    local mainGui = pg:FindFirstChild(SC_CFG.guiName)
+    if mainGui and grab(mainGui) then return end
     for _, g in ipairs(pg:GetChildren()) do
-        if g ~= gui and g ~= main and g:IsA("ScreenGui") and scMatch(g.Name, SC_CFG.guiWords) then
+        if g ~= gui and g ~= mainGui and g:IsA("ScreenGui") and scMatch(g.Name, SC_CFG.guiWords) then
             if grab(g) then return end
         end
     end
 end
 
--- skill check id in the character -> type. add a substring here if the game uses another id.
--- "trap" is only used to recognise trap checks so they are left alone.
 local SC_IDS = {
     generator = {"gen"},
     heal = {"heal"},
@@ -659,7 +648,6 @@ local function scCtxFromChar()
     return nil
 end
 
--- fallback: nearest object
 local function scCtxProximity()
     local chr = player.Character
     local root = chr and chr:FindFirstChild("HumanoidRootPart")
@@ -690,14 +678,13 @@ local function scCtxProximity()
     return bestKind
 end
 
--- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
 local function scPress()
     task.spawn(function()
         local sent = false
         if VirtualInputManager then
             sent = pcall(function()
                 VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
-                task.wait(0.03)
+                task.wait(0.02)
                 VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
             end)
         end
@@ -709,10 +696,20 @@ local function scPress()
                 }, false)
             end)
         end
-        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
-            pcall(function() firesignal(scB.MouseButton1Down) end)
-            pcall(function() firesignal(scB.MouseButton1Click) end)
-            pcall(function() firesignal(scB.Activated) end)
+        if scB then
+            pcall(function() if firesignal then firesignal(scB.MouseButton1Down) end end)
+            pcall(function() if firesignal then firesignal(scB.MouseButton1Click) end end)
+            pcall(function() if firesignal then firesignal(scB.Activated) end end)
+            pcall(function() scB:SimulateClick() end)
+        end
+        if VirtualInputManager and UserInputService.TouchEnabled then
+            pcall(function()
+                local cam = workspace.CurrentCamera
+                local vp = cam and cam.ViewportSize or Vector2.new(800, 600)
+                VirtualInputManager:SendTouchEvent(1, Enum.UserInputState.Begin, Vector2.new(vp.X/2, vp.Y/2))
+                task.wait(0.02)
+                VirtualInputManager:SendTouchEvent(1, Enum.UserInputState.End, Vector2.new(vp.X/2, vp.Y/2))
+            end)
         end
     end)
 end
@@ -745,7 +742,6 @@ local function scStep(dt)
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
-        -- next skill check in a chain: the zone moved, or the needle jumped / went back / stopped, or timeout
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
         local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
@@ -766,9 +762,8 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then return end -- needle is not moving yet
+    if math.abs(vel) < 20 then return end 
 
-    -- which skill check: character id first, then the nearest object
     local ctx, rawId = scCtxFromChar()
     if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
         scCtx = scCtxProximity() or "any"
@@ -792,7 +787,6 @@ local function scStep(dt)
     local diffNow = scDiff(rot, target)
     local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
 
-    -- press when the needle crosses the target on the next frame or is already inside tolerance
     local dirNow = vel >= 0 and 1 or -1
     local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
@@ -805,11 +799,11 @@ local function scStep(dt)
 end
 
 ---------------------------------------------------------------------
--- menu window
+-- menu window (Размеры уменьшены для телефонов: 310х390)
 ---------------------------------------------------------------------
 local main = new("Frame", {
     Name = "Main",
-    Size = UDim2.fromOffset(380, 470),
+    Size = UDim2.fromOffset(310, 390), 
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = THEME.bg,
@@ -845,10 +839,10 @@ local topbar = new("Frame", {
 
 local title = new("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(18, 0),
-    Size = UDim2.fromOffset(70, 44),
+    Position = UDim2.fromOffset(14, 0),
+    Size = UDim2.fromOffset(50, 44),
     Font = Enum.Font.GothamBlack,
-    TextSize = 20,
+    TextSize = 18,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = Color3.new(1, 1, 1),
     Text = "pups",
@@ -857,23 +851,23 @@ new("UIGradient", {Color = ColorSequence.new(THEME.accent, THEME.accent2)}, titl
 
 new("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(84, 3),
-    Size = UDim2.fromOffset(220, 44),
+    Position = UDim2.fromOffset(64, 2),
+    Size = UDim2.new(1, -110, 0, 44),
     Font = Enum.Font.GothamMedium,
-    TextSize = 12,
+    TextSize = 10,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
-    Text = "Violence District  |  K - menu",
+    Text = "VD District | K-Menu",
 }, topbar)
 
 local closeBtn = new("TextButton", {
-    Size = UDim2.fromOffset(28, 28),
-    Position = UDim2.new(1, -42, 0, 8),
+    Size = UDim2.fromOffset(26, 26),
+    Position = UDim2.new(1, -36, 0, 9),
     BackgroundColor3 = THEME.item,
     AutoButtonColor = false,
     Text = "X",
     Font = Enum.Font.GothamBold,
-    TextSize = 13,
+    TextSize = 12,
     TextColor3 = THEME.dim,
 }, topbar)
 corner(closeBtn, 8)
@@ -901,7 +895,7 @@ new("UIGradient", {
 }, topLine)
 
 local page = new("ScrollingFrame", {
-    Position = UDim2.fromOffset(10, 56),
+    Position = UDim2.fromOffset(10, 52),
     Size = UDim2.new(1, -20, 1, -66),
     BackgroundTransparency = 1,
     BorderSizePixel = 0,
@@ -911,21 +905,21 @@ local page = new("ScrollingFrame", {
     AutomaticCanvasSize = Enum.AutomaticSize.Y,
 }, main)
 new("UIListLayout", {
-    Padding = UDim.new(0, 8),
+    Padding = UDim.new(0, 6),
     SortOrder = Enum.SortOrder.LayoutOrder,
 }, page)
 new("UIPadding", {
-    PaddingRight = UDim.new(0, 6),
+    PaddingRight = UDim.new(0, 4),
     PaddingTop = UDim.new(0, 2),
-    PaddingBottom = UDim.new(0, 6),
+    PaddingBottom = UDim.new(0, 12),
 }, page)
 
 local function addSection(text)
     new("TextLabel", {
-        Size = UDim2.new(1, 0, 0, 18),
+        Size = UDim2.new(1, 0, 0, 16),
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
-        TextSize = 11,
+        TextSize = 10,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextColor3 = THEME.dim,
         Text = string.upper(text),
@@ -935,7 +929,7 @@ end
 
 local function addToggle(text, default, callback, bindId, defaultKey)
     local row = new("Frame", {
-        Size = UDim2.new(1, 0, 0, 40),
+        Size = UDim2.new(1, 0, 0, 36),
         BackgroundColor3 = THEME.item,
         BorderSizePixel = 0,
         LayoutOrder = nextOrder(),
@@ -944,30 +938,30 @@ local function addToggle(text, default, callback, bindId, defaultKey)
 
     new("TextLabel", {
         BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(14, 0),
-        Size = UDim2.new(1, bindId and -158 or -80, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        Size = UDim2.new(1, bindId and -140 or -70, 1, 0),
         Font = Enum.Font.GothamMedium,
-        TextSize = 14,
+        TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextColor3 = THEME.text,
         Text = text,
     }, row)
 
     local track = new("Frame", {
-        Size = UDim2.fromOffset(44, 22),
-        Position = UDim2.new(1, -58, 0.5, -11),
+        Size = UDim2.fromOffset(40, 20),
+        Position = UDim2.new(1, -52, 0.5, -10),
         BackgroundColor3 = THEME.off,
         BorderSizePixel = 0,
     }, row)
-    corner(track, 11)
+    corner(track, 10)
 
     local knob = new("Frame", {
-        Size = UDim2.fromOffset(16, 16),
+        Size = UDim2.fromOffset(14, 14),
         Position = UDim2.fromOffset(3, 3),
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
     }, track)
-    corner(knob, 8)
+    corner(knob, 7)
 
     local click = new("TextButton", {
         Size = UDim2.fromScale(1, 1),
@@ -980,7 +974,7 @@ local function addToggle(text, default, callback, bindId, defaultKey)
 
     local function render()
         tween(track, {BackgroundColor3 = state and THEME.accent or THEME.off}, 0.2)
-        tween(knob, {Position = state and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)}, 0.2, Enum.EasingStyle.Back)
+        tween(knob, {Position = state and UDim2.fromOffset(23, 3) or UDim2.fromOffset(3, 3)}, 0.2, Enum.EasingStyle.Back)
     end
 
     function obj.set(v)
@@ -989,19 +983,13 @@ local function addToggle(text, default, callback, bindId, defaultKey)
         pcall(callback, state)
     end
 
-    function obj.get()
-        return state
-    end
+    function obj.get() return state end
 
-    connect(click.Activated, function()
-        obj.set(not state)
-    end)
+    connect(click.Activated, function() obj.set(not state) end)
 
     if bindId then
-        registerBind(bindId, defaultKey, function()
-            obj.set(not state)
-        end)
-        makeBindButton(row, bindId, UDim2.new(1, -136, 0.5, -12))
+        registerBind(bindId, defaultKey, function() obj.set(not state) end)
+        makeBindButton(row, bindId, UDim2.new(1, -128, 0.5, -12))
     end
 
     render()
@@ -1010,7 +998,7 @@ end
 
 local function addBindRow(text, id, defaultKey, action)
     local row = new("Frame", {
-        Size = UDim2.new(1, 0, 0, 40),
+        Size = UDim2.new(1, 0, 0, 36),
         BackgroundColor3 = THEME.item,
         BorderSizePixel = 0,
         LayoutOrder = nextOrder(),
@@ -1018,37 +1006,33 @@ local function addBindRow(text, id, defaultKey, action)
     corner(row, 8)
     new("TextLabel", {
         BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(14, 0),
-        Size = UDim2.new(1, -100, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        Size = UDim2.new(1, -90, 1, 0),
         Font = Enum.Font.GothamMedium,
-        TextSize = 14,
+        TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextColor3 = THEME.text,
         Text = text,
     }, row)
     registerBind(id, defaultKey, action)
-    makeBindButton(row, id, UDim2.new(1, -86, 0.5, -12))
+    makeBindButton(row, id, UDim2.new(1, -82, 0.5, -12))
 end
 
 local function addButton(text, callback)
     local btn = new("TextButton", {
-        Size = UDim2.new(1, 0, 0, 38),
+        Size = UDim2.new(1, 0, 0, 34),
         BackgroundColor3 = THEME.item,
         AutoButtonColor = false,
         Text = text,
         Font = Enum.Font.GothamMedium,
-        TextSize = 14,
+        TextSize = 12,
         TextColor3 = THEME.text,
         LayoutOrder = nextOrder(),
     }, page)
     corner(btn, 8)
 
-    connect(btn.MouseEnter, function()
-        tween(btn, {BackgroundColor3 = THEME.hover}, 0.15)
-    end)
-    connect(btn.MouseLeave, function()
-        tween(btn, {BackgroundColor3 = THEME.item}, 0.15)
-    end)
+    connect(btn.MouseEnter, function() tween(btn, {BackgroundColor3 = THEME.hover}, 0.15) end)
+    connect(btn.MouseLeave, function() tween(btn, {BackgroundColor3 = THEME.item}, 0.15) end)
     connect(btn.Activated, function()
         btn.BackgroundColor3 = THEME.accent
         tween(btn, {BackgroundColor3 = THEME.hover}, 0.3)
@@ -1058,13 +1042,52 @@ local function addButton(text, callback)
 end
 
 ---------------------------------------------------------------------
+-- Кнопка Ресайза (Изменение размера меню перетаскиванием)
+---------------------------------------------------------------------
+local resizeBtn = new("ImageButton", {
+    Name = "ResizeGrip",
+    Size = UDim2.fromOffset(16, 16),
+    Position = UDim2.new(1, -16, 1, -16),
+    BackgroundTransparency = 1,
+    Image = "rbxassetid://6031094678", 
+    ImageColor3 = THEME.dim,
+    ZIndex = 5,
+}, main)
+
+local resizing = false
+local resizeStartPos, resizeStartSize
+
+connect(resizeBtn.InputBegan, function(input)
+    if isPointer(input) then
+        resizing = true
+        resizeStartPos = input.Position
+        resizeStartSize = main.Size
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if resizing and isMove(input) then
+        local delta = input.Position - resizeStartPos
+        local newX = math.clamp(resizeStartSize.X.Offset + delta.X, 260, 600) 
+        local newY = math.clamp(resizeStartSize.Y.Offset + delta.Y, 300, 700) 
+        main.Size = UDim2.fromOffset(newX, newY)
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if isPointer(input) then
+        resizing = false
+    end
+end)
+
+---------------------------------------------------------------------
 -- color picker (HSV sliders popup)
 ---------------------------------------------------------------------
 local colorSwatches = {}
 
 local picker = new("Frame", {
     Name = "ColorPicker",
-    Size = UDim2.fromOffset(330, 300),
+    Size = UDim2.fromOffset(280, 280),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = THEME.panel,
@@ -1082,18 +1105,18 @@ new("UIStroke", {
 
 local pickerTitle = new("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(16, 10),
-    Size = UDim2.new(1, -90, 0, 22),
+    Position = UDim2.fromOffset(14, 10),
+    Size = UDim2.new(1, -80, 0, 20),
     Font = Enum.Font.GothamBold,
-    TextSize = 14,
+    TextSize = 12,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.text,
     Text = "Color",
 }, picker)
 
 local preview = new("Frame", {
-    Position = UDim2.new(1, -60, 0, 10),
-    Size = UDim2.fromOffset(44, 22),
+    Position = UDim2.new(1, -54, 0, 10),
+    Size = UDim2.fromOffset(40, 20),
     BackgroundColor3 = Color3.new(1, 1, 1),
     BorderSizePixel = 0,
 }, picker)
@@ -1102,33 +1125,33 @@ corner(preview, 6)
 local function makeSlider(parent, y, labelText, onChange)
     new("TextLabel", {
         BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(16, y),
-        Size = UDim2.fromOffset(20, 20),
+        Position = UDim2.fromOffset(14, y),
+        Size = UDim2.fromOffset(16, 16),
         Font = Enum.Font.GothamBold,
-        TextSize = 12,
+        TextSize = 11,
         TextColor3 = THEME.dim,
         Text = labelText,
     }, parent)
 
     local track = new("Frame", {
-        Position = UDim2.fromOffset(40, y + 4),
-        Size = UDim2.new(1, -62, 0, 12),
+        Position = UDim2.fromOffset(34, y + 2),
+        Size = UDim2.new(1, -50, 0, 10),
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
         Active = true,
     }, parent)
-    corner(track, 6)
+    corner(track, 5)
     local grad = new("UIGradient", nil, track)
 
     local knob = new("Frame", {
-        Size = UDim2.fromOffset(10, 20),
+        Size = UDim2.fromOffset(10, 16),
         AnchorPoint = Vector2.new(0.5, 0.5),
         Position = UDim2.fromScale(0, 0.5),
         BackgroundColor3 = Color3.new(1, 1, 1),
         BorderSizePixel = 0,
     }, track)
     corner(knob, 4)
-    new("UIStroke", {Thickness = 1.5, Color = Color3.new(0, 0, 0)}, knob)
+    new("UIStroke", {Thickness = 1, Color = Color3.new(0, 0, 0)}, knob)
 
     local s = {grad = grad}
     local dragging = false
@@ -1146,20 +1169,13 @@ local function makeSlider(parent, y, labelText, onChange)
     end
 
     connect(track.InputBegan, function(input)
-        if isPointer(input) then
-            dragging = true
-            fromInput(input)
-        end
+        if isPointer(input) then dragging = true; fromInput(input) end
     end)
     connect(UserInputService.InputChanged, function(input)
-        if dragging and isMove(input) then
-            fromInput(input)
-        end
+        if dragging and isMove(input) then fromInput(input) end
     end)
     connect(UserInputService.InputEnded, function(input)
-        if isPointer(input) then
-            dragging = false
-        end
+        if isPointer(input) then dragging = false end
     end)
 
     return s
@@ -1171,10 +1187,10 @@ local hueS, satS, valS
 
 local rgbLabel = new("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(16, 142),
-    Size = UDim2.new(1, -32, 0, 18),
+    Position = UDim2.fromOffset(14, 130),
+    Size = UDim2.new(1, -28, 0, 16),
     Font = Enum.Font.GothamMedium,
-    TextSize = 12,
+    TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
     Text = "",
@@ -1186,66 +1202,40 @@ local function pickerRender()
     preview.BackgroundColor3 = c
     satS.grad.Color = ColorSequence.new(Color3.fromHSV(h, 0, v), Color3.fromHSV(h, 1, v))
     valS.grad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(h, s, 1))
-    rgbLabel.Text = string.format(
-        "RGB: %d, %d, %d",
-        math.floor(c.R * 255 + 0.5),
-        math.floor(c.G * 255 + 0.5),
-        math.floor(c.B * 255 + 0.5)
-    )
+    rgbLabel.Text = string.format("RGB: %d, %d, %d", math.floor(c.R * 255 + 0.5), math.floor(c.G * 255 + 0.5), math.floor(c.B * 255 + 0.5))
 end
 
 local function pickerApply()
     if not pickKey then return end
     local c = Color3.fromHSV(hsv[1], hsv[2], hsv[3])
     ESPColors[pickKey] = c
-    if colorSwatches[pickKey] then
-        colorSwatches[pickKey].BackgroundColor3 = c
-    end
+    if colorSwatches[pickKey] then colorSwatches[pickKey].BackgroundColor3 = c end
     espApplyColors()
     pickerRender()
 end
 
 local rainbowKeys = {}
-for i = 0, 6 do
-    table.insert(rainbowKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(math.min(i / 6, 0.999), 1, 1)))
-end
+for i = 0, 6 do table.insert(rainbowKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(math.min(i / 6, 0.999), 1, 1))) end
 
-hueS = makeSlider(picker, 48, "H", function(v)
-    hsv[1] = v
-    pickerApply()
-end)
+hueS = makeSlider(picker, 42, "H", function(v) hsv[1] = v; pickerApply() end)
 hueS.grad.Color = ColorSequence.new(rainbowKeys)
-
-satS = makeSlider(picker, 80, "S", function(v)
-    hsv[2] = v
-    pickerApply()
-end)
-
-valS = makeSlider(picker, 112, "V", function(v)
-    hsv[3] = v
-    pickerApply()
-end)
+satS = makeSlider(picker, 70, "S", function(v) hsv[2] = v; pickerApply() end)
+valS = makeSlider(picker, 98, "V", function(v) hsv[3] = v; pickerApply() end)
 
 new("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(16, 168),
-    Size = UDim2.fromOffset(100, 16),
+    Position = UDim2.fromOffset(14, 154),
+    Size = UDim2.fromOffset(100, 14),
     Font = Enum.Font.GothamBold,
-    TextSize = 11,
+    TextSize = 10,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
     Text = "PRESET COLORS",
 }, picker)
 
 local PRESETS = {
-    Color3.fromRGB(255, 60, 60),
-    Color3.fromRGB(255, 160, 60),
-    Color3.fromRGB(255, 220, 60),
-    Color3.fromRGB(80, 255, 130),
-    Color3.fromRGB(60, 200, 255),
-    Color3.fromRGB(140, 90, 255),
-    Color3.fromRGB(255, 100, 220),
-    Color3.fromRGB(255, 255, 255),
+    Color3.fromRGB(255, 60, 60), Color3.fromRGB(255, 160, 60), Color3.fromRGB(255, 220, 60), Color3.fromRGB(80, 255, 130),
+    Color3.fromRGB(60, 200, 255), Color3.fromRGB(140, 90, 255), Color3.fromRGB(255, 100, 220), Color3.fromRGB(255, 255, 255),
 }
 
 local function pickerLoad(color)
@@ -1258,35 +1248,29 @@ end
 
 for i, col in ipairs(PRESETS) do
     local b = new("TextButton", {
-        Position = UDim2.fromOffset(16 + (i - 1) * 38, 190),
-        Size = UDim2.fromOffset(30, 30),
+        Position = UDim2.fromOffset(14 + (i - 1) * 32, 172),
+        Size = UDim2.fromOffset(26, 26),
         BackgroundColor3 = col,
         AutoButtonColor = false,
         Text = "",
     }, picker)
-    corner(b, 8)
-    connect(b.Activated, function()
-        pickerLoad(col)
-        pickerApply()
-    end)
+    corner(b, 6)
+    connect(b.Activated, function() pickerLoad(col); pickerApply() end)
 end
 
 local function closePicker()
-    if picker.Visible then
-        picker.Visible = false
-        saveColors()
-    end
+    if picker.Visible then picker.Visible = false; saveColors() end
     pickKey = nil
 end
 
 local doneBtn = new("TextButton", {
-    Position = UDim2.fromOffset(16, 244),
-    Size = UDim2.new(1, -32, 0, 38),
+    Position = UDim2.fromOffset(14, 225),
+    Size = UDim2.new(1, -28, 0, 34),
     BackgroundColor3 = THEME.accent,
     AutoButtonColor = false,
     Text = "Done",
     Font = Enum.Font.GothamBold,
-    TextSize = 14,
+    TextSize = 13,
     TextColor3 = Color3.new(1, 1, 1),
 }, picker)
 corner(doneBtn, 8)
@@ -1302,7 +1286,7 @@ end
 
 local function addColorRow(text, key)
     local row = new("Frame", {
-        Size = UDim2.new(1, 0, 0, 40),
+        Size = UDim2.new(1, 0, 0, 36),
         BackgroundColor3 = THEME.item,
         BorderSizePixel = 0,
         LayoutOrder = nextOrder(),
@@ -1311,34 +1295,27 @@ local function addColorRow(text, key)
 
     new("TextLabel", {
         BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(14, 0),
-        Size = UDim2.new(1, -80, 1, 0),
+        Position = UDim2.fromOffset(12, 0),
+        Size = UDim2.new(1, -70, 1, 0),
         Font = Enum.Font.GothamMedium,
-        TextSize = 14,
+        TextSize = 12,
         TextXAlignment = Enum.TextXAlignment.Left,
         TextColor3 = THEME.text,
         Text = text,
     }, row)
 
     local sw = new("TextButton", {
-        Size = UDim2.fromOffset(44, 22),
-        Position = UDim2.new(1, -58, 0.5, -11),
+        Size = UDim2.fromOffset(40, 20),
+        Position = UDim2.new(1, -52, 0.5, -10),
         BackgroundColor3 = ESPColors[key],
         AutoButtonColor = false,
         Text = "",
     }, row)
     corner(sw, 6)
-    new("UIStroke", {
-        Thickness = 1,
-        Color = THEME.text,
-        Transparency = 0.6,
-        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-    }, sw)
+    new("UIStroke", {Thickness = 1, Color = THEME.text, Transparency = 0.6, ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, sw)
 
     colorSwatches[key] = sw
-    connect(sw.Activated, function()
-        openPicker(key, text)
-    end)
+    connect(sw.Activated, function() openPicker(key, text) end)
 end
 
 ---------------------------------------------------------------------
@@ -1346,7 +1323,6 @@ end
 ---------------------------------------------------------------------
 local opened = true
 
--- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
     Size = UDim2.fromOffset(0, 0),
     BackgroundTransparency = 1,
@@ -1354,8 +1330,6 @@ local modalBtn = new("TextButton", {
     Modal = true,
 }, main)
 
--- remember mouse state at the first force and restore it on close,
--- otherwise the camera stays in Default and only rotates with RMB
 local prevMouseIcon = UserInputService.MouseIconEnabled
 local prevMouseBehavior = UserInputService.MouseBehavior
 local mouseForced = false
@@ -1368,8 +1342,6 @@ local function mouseRelease()
     end
 end
 
--- what the game tried to set while the menu was forcing the cursor (round start etc.)
--- our own forced values are Default / icon on, so anything else is the game's
 local gameBehavior, gameIcon = nil, nil
 connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
     if opened and mouseForced then
@@ -1378,9 +1350,7 @@ connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
     end
 end)
 connect(UserInputService:GetPropertyChangedSignal("MouseIconEnabled"), function()
-    if opened and mouseForced and UserInputService.MouseIconEnabled == false then
-        gameIcon = false
-    end
+    if opened and mouseForced and UserInputService.MouseIconEnabled == false then gameIcon = false end
 end)
 
 local function mouseRestore()
@@ -1390,7 +1360,6 @@ local function mouseRestore()
     local iconOn = prevMouseIcon
     if gameIcon ~= nil then iconOn = gameIcon end
     gameBehavior, gameIcon = nil, nil
-    -- first person lock: the game wants the cursor hidden and centered
     if player.CameraMode == Enum.CameraMode.LockFirstPerson then
         behavior = Enum.MouseBehavior.LockCenter
         iconOn = false
@@ -1410,9 +1379,7 @@ local function setOpen(v)
         modalBtn.Modal = false
         mouseRestore()
         tween(scale, {Scale = 0}, 0.2)
-        task.delay(0.22, function()
-            if not opened then main.Visible = false end
-        end)
+        task.delay(0.22, function() if not opened then main.Visible = false end end)
     end
 end
 
@@ -1424,48 +1391,33 @@ local vp0 = cam0 and cam0.ViewportSize or Vector2.new(800, 600)
 
 local icon = new("TextButton", {
     Name = "ToggleIcon",
-    Size = UDim2.fromOffset(50, 50),
+    Size = UDim2.fromOffset(46, 46),
     Position = UDim2.fromOffset(16, math.floor(vp0.Y * 0.35)),
     BackgroundColor3 = THEME.bg,
     AutoButtonColor = false,
     Text = "pups",
     Font = Enum.Font.GothamBlack,
-    TextSize = 14,
+    TextSize = 13,
     TextColor3 = Color3.new(1, 1, 1),
     ZIndex = 20,
 }, gui)
-corner(icon, 25)
-local iconStroke = new("UIStroke", {
-    Thickness = 2.5,
-    Color = Color3.new(1, 1, 1),
-    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
-}, icon)
+corner(icon, 23)
+local iconStroke = new("UIStroke", {Thickness = 2, Color = Color3.new(1, 1, 1), ApplyStrokeMode = Enum.ApplyStrokeMode.Border}, icon)
 local iconGrad = new("UIGradient", {
-    Color = ColorSequence.new({
-        ColorSequenceKeypoint.new(0, THEME.accent),
-        ColorSequenceKeypoint.new(0.5, THEME.accent2),
-        ColorSequenceKeypoint.new(1, THEME.accent),
-    }),
+    Color = ColorSequence.new({ColorSequenceKeypoint.new(0, THEME.accent), ColorSequenceKeypoint.new(0.5, THEME.accent2), ColorSequenceKeypoint.new(1, THEME.accent)}),
 }, iconStroke)
 
 local iconDown, iconMoved = false, false
 local iconStartIn, iconStartPos = nil, nil
 
 connect(icon.InputBegan, function(input)
-    if isPointer(input) then
-        iconDown = true
-        iconMoved = false
-        iconStartIn = input.Position
-        iconStartPos = icon.Position
-    end
+    if isPointer(input) then iconDown = true; iconMoved = false; iconStartIn = input.Position; iconStartPos = icon.Position end
 end)
 
 connect(UserInputService.InputChanged, function(input)
     if iconDown and isMove(input) then
         local d = input.Position - iconStartIn
-        if d.Magnitude > 6 then
-            iconMoved = true
-        end
+        if d.Magnitude > 6 then iconMoved = true end
         if iconMoved then
             local cam = workspace.CurrentCamera
             local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
@@ -1478,88 +1430,45 @@ connect(UserInputService.InputChanged, function(input)
 end)
 
 connect(UserInputService.InputEnded, function(input)
-    if iconDown and isPointer(input) then
-        iconDown = false
-        if not iconMoved then
-            setOpen(not opened)
-        end
-    end
+    if iconDown and isPointer(input) then iconDown = false; if not iconMoved then setOpen(not opened) end end
 end)
 
 ---------------------------------------------------------------------
 -- menu content
 ---------------------------------------------------------------------
 addSection("Players")
-
-addToggle("Survivors", false, function(v)
-    espSet("survivors", v)
-end, "espsurv")
-
-addToggle("Killer", false, function(v)
-    espSet("killer", v)
-end, "espkiller")
+addToggle("Survivors", false, function(v) espSet("survivors", v) end, "espsurv")
+addToggle("Killer", false, function(v) espSet("killer", v) end, "espkiller")
 
 addSection("World")
-
-addToggle("Generators", false, function(v)
-    espSet("generators", v)
-end, "espgens")
+addToggle("Generators", false, function(v) espSet("generators", v) end, "espgens")
 
 addSection("ESP Colors")
-
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
 addColorRow("Generators", "generators")
-
 addButton("Reset colors", function()
     for k, v in pairs(DEFAULT_COLORS) do
         ESPColors[k] = v
-        if colorSwatches[k] then
-            colorSwatches[k].BackgroundColor3 = v
-        end
+        if colorSwatches[k] then colorSwatches[k].BackgroundColor3 = v end
     end
-    espApplyColors()
-    saveColors()
+    espApplyColors(); saveColors()
 end)
 
 addSection("ESP Settings")
-
-addToggle("Names / distance", true, function(v)
-    ESP.names = v
-end, "espnames")
+addToggle("Names / distance", true, function(v) ESP.names = v end, "espnames")
 
 addSection("Auto Skill Check")
-
-addToggle("Generators", false, function(v)
-    SC.generator = v
-end, "scgen")
-
-addToggle("Generators: perfect (off = normal)", true, function(v)
-    SC.genPerfect = v
-end, "scgenperfect")
-
-addToggle("Heal teammates", false, function(v)
-    SC.heal = v
-end, "scheal")
-
-addToggle("Heal: perfect (off = normal)", true, function(v)
-    SC.healPerfect = v
-end, "schealperfect")
+addToggle("Generators", false, function(v) SC.generator = v end, "scgen")
+addToggle("Generators: perfect (off = normal)", true, function(v) SC.genPerfect = v end, "scgenperfect")
+addToggle("Heal teammates", false, function(v) SC.heal = v end, "scheal")
+addToggle("Heal: perfect (off = normal)", true, function(v) SC.healPerfect = v end, "schealperfect")
 
 addSection("Settings")
+addBindRow("Menu key", "menu", Enum.KeyCode.K, function() setOpen(not opened) end)
+addButton("Unload pups", function() if env.__VDEspCleanup then env.__VDEspCleanup() end end)
 
-addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
-    setOpen(not opened)
-end)
-
-addButton("Unload pups", function()
-    if env.__VDEspCleanup then env.__VDEspCleanup() end
-end)
-
-connect(closeBtn.Activated, function()
-    setOpen(false)
-end)
-
+connect(closeBtn.Activated, function() setOpen(false) end)
 tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
@@ -1568,7 +1477,7 @@ tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
 local dragging, dragStart, startPos = false, nil, nil
 
 connect(topbar.InputBegan, function(input)
-    if isPointer(input) then
+    if isPointer(input) and not resizing then
         dragging = true
         dragStart = input.Position
         startPos = main.Position
@@ -1578,17 +1487,12 @@ end)
 connect(UserInputService.InputChanged, function(input)
     if dragging and isMove(input) then
         local d = input.Position - dragStart
-        main.Position = UDim2.new(
-            startPos.X.Scale, startPos.X.Offset + d.X,
-            startPos.Y.Scale, startPos.Y.Offset + d.Y
-        )
+        main.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
     end
 end)
 
 connect(UserInputService.InputEnded, function(input)
-    if isPointer(input) then
-        dragging = false
-    end
+    if isPointer(input) then dragging = false end
 end)
 
 connect(RunService.RenderStepped, function(dt)
@@ -1596,15 +1500,10 @@ connect(RunService.RenderStepped, function(dt)
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
 
-    -- while the menu is open the cursor is visible and unlocked
     if opened then
-        mouseRelease() -- save game state first, then force
-        if not UserInputService.MouseIconEnabled then
-            UserInputService.MouseIconEnabled = true
-        end
-        if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
-            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-        end
+        mouseRelease()
+        if not UserInputService.MouseIconEnabled then UserInputService.MouseIconEnabled = true end
+        if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then UserInputService.MouseBehavior = Enum.MouseBehavior.Default end
     end
 
     pcall(scStep, dt)
@@ -1615,17 +1514,11 @@ end)
 ---------------------------------------------------------------------
 env.__VDEspCleanup = function()
     saveColors()
-    for k in pairs(ESP) do
-        if k ~= "names" then ESP[k] = false end
-    end
+    for k in pairs(ESP) do if k ~= "names" then ESP[k] = false end end
     espClear()
-
     SC.generator, SC.heal = false, false
     pcall(mouseRestore)
-
-    for _, c in ipairs(connections) do
-        pcall(function() c:Disconnect() end)
-    end
+    for _, c in ipairs(connections) do pcall(function() c:Disconnect() end) end
     gui:Destroy()
     env.__VDEspCleanup = nil
 end
