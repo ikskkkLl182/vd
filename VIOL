@@ -561,7 +561,6 @@ local SC_CFG = {
     key = Enum.KeyCode.Space,
     genRange = 12,
     playerRange = 12,
-    mobileLead = 0.03, -- fixed, matches reference script, no UI
     actionPath = "Survivor-mob.Controls.action.check", -- fixed mobile button path, from reference script
     touchId = 8822,
 }
@@ -577,6 +576,15 @@ local function scMakeTiming()
     }
 end
 local SC_TIMING = scMakeTiming()
+
+-- mobile windows, ported from the reference script: tap as soon as the needle is inside Goal+a .. Goal+b
+-- perfect = 101..115 (reference), normal = 120..132 (just past the perfect zone)
+local SC_MOB = {
+    perfectStart = 101,
+    perfectEnd = 115,
+    normalStart = 120,
+    normalEnd = 132,
+}
 
 local function scIsMobile()
     return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
@@ -756,33 +764,78 @@ local function scKeyPress()
     end
 end
 
--- mobile: screen-space center of the button, both insets applied like the reference script
-local function scButtonCenter()
-    if not (scB and scB:IsDescendantOf(game)) then return nil end
-    local p, s = scB.AbsolutePosition, scB.AbsoluteSize
-    local inset = GuiService:GetGuiInset()
-    return p.X + s.X / 2 + inset.X, p.Y + s.Y / 2 + inset.Y
-end
-
--- fixed-path tap, matching the reference script's TriggerMobileButton (touch, no mouse fallback)
-local function scTapButton()
-    local x, y = scButtonCenter()
-    if not (x and VirtualInputManager) then return false end
-    return pcall(function()
-        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, x, y) -- 0 = Begin
-        task.wait(0.01)
-        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, x, y) -- 2 = End
-    end)
-end
-
 local function scPress()
+    task.spawn(scKeyPress)
+end
+
+---------------------------------------------------------------------
+-- mobile auto skill check: logic taken 1:1 from the reference script
+-- (Visible signal of SkillCheckPromptGui.Check -> Heartbeat window Goal+a .. Goal+b -> touch tap)
+---------------------------------------------------------------------
+local scMobVis, scMobHB, scMobGen = nil, nil, 0
+
+local function scMobStop()
+    if scMobHB then
+        scMobHB:Disconnect()
+        scMobHB = nil
+    end
+end
+
+local function scTriggerMobileButton()
+    local b = scGetFixedButton()
+    if b and b:IsA("GuiObject") then
+        local p, s, i = b.AbsolutePosition, b.AbsoluteSize, GuiService:GetGuiInset()
+        local cx, cy = p.X + (s.X / 2) + i.X, p.Y + (s.Y / 2) + i.Y
+        pcall(function()
+            VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, cx, cy)
+            task.wait(0.01)
+            VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, cx, cy)
+        end)
+    end
+end
+
+local function scMobInit()
+    scMobGen = scMobGen + 1
+    local gen = scMobGen
     task.spawn(function()
-        if scIsMobile() then
-            if scTapButton() then return end
-        end
-        scKeyPress()
+        local pg = player:WaitForChild("PlayerGui")
+        local prompt = pg:WaitForChild("SkillCheckPromptGui", 10)
+        local check = prompt and prompt:WaitForChild("Check", 10)
+        if not check or gen ~= scMobGen then return end
+        local line, goal = check:WaitForChild("Line"), check:WaitForChild("Goal")
+        if scMobVis then scMobVis:Disconnect() end
+        scMobVis = check:GetPropertyChangedSignal("Visible"):Connect(function()
+            if SC.enabled and player.Team and player.Team.Name == "Survivors" and check.Visible then
+                scMobStop()
+                scMobHB = RunService.Heartbeat:Connect(function()
+                    if not SC.enabled then
+                        scMobStop()
+                        return
+                    end
+                    local lr, gr = line.Rotation % 360, goal.Rotation % 360
+                    local wa, wb = SC_MOB.perfectStart, SC_MOB.perfectEnd
+                    if not SC.perfect then wa, wb = SC_MOB.normalStart, SC_MOB.normalEnd end
+                    local ss, se = (gr + wa) % 360, (gr + wb) % 360
+                    if (ss > se and (lr >= ss or lr <= se)) or (lr >= ss and lr <= se) then
+                        if scCtxFromChar() ~= "trap" then
+                            scTriggerMobileButton()
+                        end
+                        scMobStop()
+                    end
+                end)
+            else
+                scMobStop()
+            end
+        end)
     end)
 end
+
+connect(player.CharacterAdded, function()
+    scMobStop()
+    task.wait(1)
+    if scIsMobile() then scMobInit() end
+end)
+if scIsMobile() then scMobInit() end
 
 connect(player.CharacterAdded, scReset)
 do
@@ -791,6 +844,7 @@ do
 end
 
 local function scStep(dt)
+    if scIsMobile() then return end -- phones: handled by scMobInit (reference script logic)
     if not SC.enabled then
         scLast = nil
         scN, scZ = nil, nil
@@ -844,7 +898,7 @@ local function scStep(dt)
 
     local center = SC.perfect and SC_TIMING.perfectCenter or SC_TIMING.normalCenter
     local tol = SC.perfect and SC_TIMING.perfectTol or SC_TIMING.normalTol
-    local lead = SC_TIMING.lead + (scIsMobile() and SC_CFG.mobileLead or 0)
+    local lead = SC_TIMING.lead
     local target = scZ.Rotation + center + SC_TIMING.extra
 
     local diffNow = scDiff(rot, target)
@@ -1775,6 +1829,8 @@ env.__VDEspCleanup = function()
     espClear()
 
     SC.enabled = false
+    if scMobVis then pcall(function() scMobVis:Disconnect() end) end
+    scMobStop()
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
