@@ -1,10 +1,12 @@
 -- pups - Violence District ESP + auto skill check (generators / healing)
 -- floating icon (mobile), K key (PC), ESP color picker
+-- ОБНОВЛЕНО: исправлен мобильный авто-скиллчек на основе рабочих методов (ContextActionService + корректный SendTouchEvent)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
+local ContextActionService = game:GetService("ContextActionService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -699,10 +701,33 @@ local function scCtxProximity()
     return bestKind
 end
 
--- МОБИЛЬНЫЙ ВВОД: правильная эмуляция Touch
+-- ИСПРАВЛЕННЫЙ МОБИЛЬНЫЙ ВВОД
 local function scPressMobile()
+    -- 1. ContextActionService — основной метод для Violence District (по исходникам рабочих скриптов)
+    local casOk = pcall(function()
+        ContextActionService:CallFunction("Grab", Enum.UserInputState.Begin, game)
+    end)
+    if casOk then
+        -- Если действие "Grab" привязано и сработало, дальше можно не идти
+        return
+    end
+
+    -- 2. Получаем кнопку через ContextActionService и тапаем по ней
+    local casButton = nil
+    pcall(function()
+        casButton = ContextActionService:GetButton("Grab")
+    end)
+
     local pos = nil
-    if scB then
+    if casButton and casButton.Visible then
+        local ok, p = pcall(function()
+            return casButton.AbsolutePosition + casButton.AbsoluteSize / 2
+        end)
+        if ok and p then pos = p end
+    end
+
+    -- Если кнопку через CAS не нашли, пробуем найти через наш поиск (scB) или по зоне (scZ)
+    if not pos and scB then
         local ok, p = pcall(function()
             return scB.AbsolutePosition + scB.AbsoluteSize / 2
         end)
@@ -714,19 +739,19 @@ local function scPressMobile()
         end)
         if ok and p then pos = p end
     end
+
     if not pos then return end
 
-    -- 1. Пытаемся отправить правильное событие Touch через VirtualInputManager
+    -- 3. Корректный SendTouchEvent (сигнатура: touchId, state, x, y)
     if VirtualInputManager then
         pcall(function()
-            -- SendTouchEvent(true, x, y, game)
-            VirtualInputManager:SendTouchEvent(true, pos.X, pos.Y, game)
+            VirtualInputManager:SendTouchEvent(1, 0, pos.X, pos.Y) -- 0 = Begin
             task.wait(0.05)
-            VirtualInputManager:SendTouchEvent(false, pos.X, pos.Y, game)
+            VirtualInputManager:SendTouchEvent(1, 2, pos.X, pos.Y) -- 2 = End
         end)
     end
 
-    -- 2. Если есть firesignal, дублируем Touch-события на кнопку и в UserInputService
+    -- 4. Дополнительно: firesignal для совместимости с разными экзекьюторами
     if firesignal then
         local beginInput = {
             UserInputType = Enum.UserInputType.Touch,
@@ -741,25 +766,11 @@ local function scPressMobile()
         if scB then
             pcall(function() firesignal(scB.InputBegan, beginInput, false) end)
             pcall(function() firesignal(scB.InputEnded, endInput, false) end)
-            pcall(function() firesignal(scB.MouseButton1Down) end)
-            pcall(function() firesignal(scB.MouseButton1Up) end)
-            pcall(function() firesignal(scB.MouseButton1Click) end)
             pcall(function() firesignal(scB.Activated) end)
         end
         pcall(function() firesignal(UserInputService.InputBegan, beginInput, false) end)
         pcall(function() firesignal(UserInputService.InputEnded, endInput, false) end)
         pcall(function() firesignal(UserInputService.TouchTap, pos, Enum.UserInputType.Touch) end)
-    end
-
-    -- 3. Фолбэк: клик мышью (на некоторых мобильных экзекьюторах работает)
-    if VirtualInputManager then
-        pcall(function()
-            VirtualInputManager:SendMouseMoveEvent(pos.X, pos.Y, game)
-            task.wait(0.01)
-            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, true, game, 0)
-            task.wait(0.02)
-            VirtualInputManager:SendMouseButtonEvent(pos.X, pos.Y, 0, false, game, 0)
-        end)
     end
 end
 
