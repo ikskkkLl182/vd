@@ -565,6 +565,37 @@ connect(RunService.Heartbeat, function()
 end)
 
 ---------------------------------------------------------------------
+-- auto trap escape: while trapped (CheckInterractable.isStruggling or character IsTrapped)
+-- fires Remotes.Trap.TrapEscapeEvent(true) and presses Space; throttled to every 0.2s
+---------------------------------------------------------------------
+local TE = {escape = false}
+local teT = 0
+
+connect(RunService.Heartbeat, function(dt)
+    if not TE.escape then return end
+    teT = teT + dt
+    if teT < 0.2 then return end
+    teT = 0
+    pcall(function()
+        local chr = player.Character
+        if not chr then return end
+        local ci = chr:FindFirstChild("CheckInterractable")
+        if not ci then return end
+        if ci:GetAttribute("isStruggling") == true or chr:GetAttribute("IsTrapped") == true then
+            local remotes = ReplicatedStorage:FindFirstChild("Remotes")
+            local trap = remotes and remotes:FindFirstChild("Trap")
+            local ev = trap and trap:FindFirstChild("TrapEscapeEvent")
+            if ev then ev:FireServer(true) end
+            task.spawn(function()
+                VirtualInputManager:SendKeyEvent(true, Enum.KeyCode.Space, false, game)
+                task.wait(0.005)
+                VirtualInputManager:SendKeyEvent(false, Enum.KeyCode.Space, false, game)
+            end)
+        end
+    end)
+end)
+
+---------------------------------------------------------------------
 -- menu window
 ---------------------------------------------------------------------
 local main = new("Frame", {
@@ -1305,6 +1336,10 @@ addToggle("Auto skill check", false, function(v)
     SC.auto = v
 end, "scauto")
 
+addToggle("Auto trap escape", false, function(v)
+    TE.escape = v
+end, "tescape")
+
 addSection("Pallets / Windows")
 
 addToggle("Anti-loop (pallet + vault)", false, function(v)
@@ -1384,6 +1419,7 @@ end)
 env.__VDEspCleanup = function()
     saveColors()
     SC.auto = false
+    TE.escape = false
     PAL.block = false
     pcall(palletStop)
     ESP.survivors, ESP.killer, ESP.generators, ESP.traps = false, false, false, false
