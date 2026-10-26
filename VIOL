@@ -1,13 +1,10 @@
--- pups - Violence District ESP + auto skill check
+-- pups - Violence District ESP + auto skill check (generators / healing)
 -- floating icon (mobile), K key (PC), ESP color picker
--- mobile skill check: exact button path + GuiInset + SendTouchEvent
--- single auto skill check toggle (works for generators and healing), one perfect/normal switch
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
-local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -332,6 +329,7 @@ local function espMakeTag(part, color)
     return bb, lbl
 end
 
+-- apply current colors to all existing ESP objects
 local function espApplyColors()
     for _, it in pairs(espItems) do
         local c
@@ -350,6 +348,7 @@ local function espApplyColors()
     end
 end
 
+-- who is the killer: team name, attributes, or a "Killer" object in the character
 local function espIsKiller(plr)
     local team = plr.Team
     if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
@@ -420,6 +419,7 @@ local function espRefreshPlayers()
     end
 end
 
+-- generators: models named "Generator" anywhere in workspace (set is kept up to date via DescendantAdded)
 local genSet = {}
 
 local function espIsGenerator(obj)
@@ -518,7 +518,7 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check (single toggle for all checks)
+-- auto skill check (generators / healing)
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
@@ -526,24 +526,31 @@ pcall(function()
 end)
 
 local SC = {
-    enabled = false,
-    perfect = true,
+    generator = false,
+    heal = false,
+    genPerfect = true,   -- generators: true = perfect (white zone), false = normal
+    healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
 }
 
+-- skill check GUI:
+--   PlayerGui.SkillCheckPromptGui.Check.Line - needle
+--   PlayerGui.SkillCheckPromptGui.Check.Goal - zone
+--   perfect: Line.Rotation = Goal.Rotation + 104..114
+--   normal : Line.Rotation = Goal.Rotation + 115 and beyond
 local SC_CFG = {
     guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    perfectCenter = 111,
-    perfectTol = 3.5,
-    normalCenter = 127,
+    perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
+    perfectTol = 3.5,      -- tolerance for perfect hit
+    normalCenter = 127,    -- press point for normal hit (further than the white zone)
     normalTol = 3,
-    lead = 0.012,
-    ghExtra = 0,
-    actionPath = "Survivor-mob.Controls.action.check",
-    touchId = 8822,
+    lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
+    ghExtra = 0,           -- extra target shift (degrees). plus = press later
+    genRange = 12,
+    playerRange = 12,
 }
 
 local function scMatch(name, words)
@@ -568,6 +575,7 @@ local function scNorm(a)
     return a % 360
 end
 
+-- shortest angle difference a - b in [-180, 180)
 local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
 end
@@ -581,7 +589,7 @@ local scStill = 0
 local function scReset()
     scN, scZ, scB = nil, nil, nil
     scLast, scPressed, scCtx, scStill = nil, false, nil, 0
-    scT = 1
+    scT = 1 -- search again right away
 end
 
 local function scFindAll()
@@ -607,31 +615,12 @@ local function scFindAll()
         end
         if needle and zone then
             scN, scZ = needle, zone
-
-            local target = nil
-            local p = check or needle
-            while p and p ~= g do
-                if p:IsA("TextButton") or p:IsA("ImageButton") then
-                    target = p
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextButton") or d:IsA("ImageButton") then
+                    scB = d
                     break
                 end
-                p = p.Parent
             end
-
-            if not target then
-                local bestScore = -1
-                for _, d in ipairs(g:GetDescendants()) do
-                    if (d:IsA("TextButton") or d:IsA("ImageButton")) and d.Visible then
-                        local sz = d.AbsoluteSize
-                        local score = sz.X * sz.Y
-                        if score > bestScore then
-                            target = d
-                            bestScore = score
-                        end
-                    end
-                end
-            end
-            scB = target
             return true
         end
         return false
@@ -646,10 +635,14 @@ local function scFindAll()
     end
 end
 
+-- skill check id in the character -> type. add a substring here if the game uses another id.
+-- "trap" is only used to recognise trap checks so they are left alone.
 local SC_IDS = {
+    generator = {"gen"},
+    heal = {"heal"},
     trap = {"trap"},
 }
-local SC_ORDER = {"trap"}
+local SC_ORDER = {"generator", "heal", "trap"}
 
 local function scCtxFromChar()
     local chr = player.Character
@@ -666,111 +659,60 @@ local function scCtxFromChar()
     return nil
 end
 
-local function scGetActionTarget()
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return nil end
-    local current = pg
-    for segment in string.gmatch(SC_CFG.actionPath, "[^%.]+") do
-        current = current and current:FindFirstChild(segment)
-        if not current then return nil end
-    end
-    return current
-end
+-- fallback: nearest object
+local function scCtxProximity()
+    local chr = player.Character
+    local root = chr and chr:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local pos = root.Position
 
-local function scPressMobile()
-    -- exact button from working scripts
-    local b = scGetActionTarget()
-    if b and b:IsA("GuiObject") then
-        local p, s, inset = b.AbsolutePosition, b.AbsoluteSize, GuiService:GetGuiInset()
-        local cx = p.X + (s.X / 2) + inset.X
-        local cy = p.Y + (s.Y / 2) + inset.Y
-        if VirtualInputManager then
-            pcall(function()
-                VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, cx, cy)
-                task.wait(0.01)
-                VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, cx, cy)
-            end)
+    local bestKind, bestDist = nil, math.huge
+    local function consider(kind, dist, range)
+        if dist <= range and dist < bestDist then
+            bestKind, bestDist = kind, dist
         end
-        return
     end
 
-    -- fallback: use whatever button / zone our generic finder picked up
-    local pos = nil
-    if scB then
-        local ok, p = pcall(function()
-            return scB.AbsolutePosition + scB.AbsoluteSize / 2
-        end)
-        if ok and p then pos = p end
-    end
-    if not pos and scZ then
-        local ok, p = pcall(function()
-            return scZ.AbsolutePosition + scZ.AbsoluteSize / 2
-        end)
-        if ok and p then pos = p end
-    end
-    if not pos then return end
-
-    if VirtualInputManager then
-        pcall(function()
-            VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, pos.X, pos.Y)
-            task.wait(0.01)
-            VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, pos.X, pos.Y)
-        end)
-    end
-
-    if firesignal then
-        local beginInput = {
-            UserInputType = Enum.UserInputType.Touch,
-            Position = Vector3.new(pos.X, pos.Y, 0),
-            InputState = Enum.UserInputState.Begin,
-        }
-        local endInput = {
-            UserInputType = Enum.UserInputType.Touch,
-            Position = Vector3.new(pos.X, pos.Y, 0),
-            InputState = Enum.UserInputState.End,
-        }
-        if scB then
-            pcall(function() firesignal(scB.InputBegan, beginInput, false) end)
-            pcall(function() firesignal(scB.InputEnded, endInput, false) end)
-            pcall(function() firesignal(scB.Activated) end)
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and string.lower(obj.Name) == "generator" and not obj:FindFirstChildOfClass("Humanoid") then
+            local ok, cf = pcall(function() return obj:GetPivot() end)
+            if ok then consider("generator", (cf.Position - pos).Magnitude, SC_CFG.genRange) end
         end
-        pcall(function() firesignal(UserInputService.InputBegan, beginInput, false) end)
-        pcall(function() firesignal(UserInputService.InputEnded, endInput, false) end)
     end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not espIsKiller(plr) then
+            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if r then consider("heal", (r.Position - pos).Magnitude, SC_CFG.playerRange) end
+        end
+    end
+
+    return bestKind
 end
 
-local function scPressKeyboard()
-    local sent = false
-    if VirtualInputManager then
-        sent = pcall(function()
-            VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
-            task.wait(0.03)
-            VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
-        end)
-    end
-    if not sent and firesignal then
-        pcall(function()
-            firesignal(UserInputService.InputBegan, {
-                KeyCode = SC_CFG.key,
-                UserInputType = Enum.UserInputType.Keyboard,
-            }, false)
-        end)
-        pcall(function()
-            firesignal(UserInputService.InputEnded, {
-                KeyCode = SC_CFG.key,
-                UserInputType = Enum.UserInputType.Keyboard,
-            }, false)
-        end)
-    end
-end
-
+-- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
 local function scPress()
     task.spawn(function()
-        if UserInputService.KeyboardEnabled then
-            scPressKeyboard()
+        local sent = false
+        if VirtualInputManager then
+            sent = pcall(function()
+                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+                task.wait(0.03)
+                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+            end)
         end
-        if UserInputService.TouchEnabled then
-            scPressMobile()
+        if not sent and firesignal then
+            pcall(function()
+                firesignal(UserInputService.InputBegan, {
+                    KeyCode = SC_CFG.key,
+                    UserInputType = Enum.UserInputType.Keyboard,
+                }, false)
+            end)
+        end
+        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
+            pcall(function() firesignal(scB.MouseButton1Down) end)
+            pcall(function() firesignal(scB.MouseButton1Click) end)
+            pcall(function() firesignal(scB.Activated) end)
         end
     end)
 end
@@ -782,10 +724,9 @@ do
 end
 
 local function scStep(dt)
-    if not SC.enabled then
+    if not (SC.generator or SC.heal) then
         scLast = nil
         scN, scZ = nil, nil
-        scCtx = nil
         return
     end
 
@@ -804,6 +745,7 @@ local function scStep(dt)
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
+        -- next skill check in a chain: the zone moved, or the needle jumped / went back / stopped, or timeout
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
         local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
@@ -811,7 +753,6 @@ local function scStep(dt)
         if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2 or scStill >= 3)) or waited > 0.8 then
             scPressed = false
             scStill = 0
-            scCtx = nil
         end
         scLast = rot
         return
@@ -825,22 +766,24 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then
-        scCtx = nil
-        return
-    end
+    if math.abs(vel) < 20 then return end -- needle is not moving yet
 
+    -- which skill check: character id first, then the nearest object
     local ctx, rawId = scCtxFromChar()
-    if not ctx then
-        if scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
-            scCtx = "any"
-        end
-        ctx = scCtx
+    if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
+        scCtx = scCtxProximity() or "any"
     end
+    ctx = ctx or scCtx
     if not ctx then return end
     if ctx == "trap" then return end
+    if ctx ~= "any" and not SC[ctx] then return end
 
-    local perfect = SC.perfect
+    local perfect
+    if ctx == "heal" then
+        perfect = SC.healPerfect
+    else
+        perfect = SC.genPerfect
+    end
 
     local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
     local tol = perfect and SC_CFG.perfectTol or SC_CFG.normalTol
@@ -849,6 +792,7 @@ local function scStep(dt)
     local diffNow = scDiff(rot, target)
     local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
 
+    -- press when the needle crosses the target on the next frame or is already inside tolerance
     local dirNow = vel >= 0 and 1 or -1
     local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
@@ -865,7 +809,7 @@ end
 ---------------------------------------------------------------------
 local main = new("Frame", {
     Name = "Main",
-    Size = UDim2.fromOffset(340, 400),
+    Size = UDim2.fromOffset(380, 470),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = THEME.bg,
@@ -1113,90 +1057,6 @@ local function addButton(text, callback)
     return btn
 end
 
-local function addSlider(text, minV, maxV, defaultV, callback)
-    local row = new("Frame", {
-        Size = UDim2.new(1, 0, 0, 54),
-        BackgroundColor3 = THEME.item,
-        BorderSizePixel = 0,
-        LayoutOrder = nextOrder(),
-    }, page)
-    corner(row, 8)
-
-    local lbl = new("TextLabel", {
-        BackgroundTransparency = 1,
-        Position = UDim2.fromOffset(14, 6),
-        Size = UDim2.new(1, -28, 0, 18),
-        Font = Enum.Font.GothamMedium,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        TextColor3 = THEME.text,
-        Text = string.format("%s: %.2f", text, defaultV),
-    }, row)
-
-    local track = new("Frame", {
-        Position = UDim2.fromOffset(14, 32),
-        Size = UDim2.new(1, -28, 0, 8),
-        BackgroundColor3 = THEME.off,
-        BorderSizePixel = 0,
-        Active = true,
-    }, row)
-    corner(track, 4)
-
-    local fill = new("Frame", {
-        Size = UDim2.new((defaultV - minV) / (maxV - minV), 0, 1, 0),
-        BackgroundColor3 = THEME.accent,
-        BorderSizePixel = 0,
-    }, track)
-    corner(fill, 4)
-
-    local knob = new("Frame", {
-        Size = UDim2.fromOffset(14, 14),
-        AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = UDim2.new((defaultV - minV) / (maxV - minV), 0, 0.5, 0),
-        BackgroundColor3 = Color3.new(1, 1, 1),
-        BorderSizePixel = 0,
-    }, track)
-    corner(knob, 7)
-
-    local value = defaultV
-    local dragging = false
-
-    local function setV(v)
-        value = math.clamp(v, minV, maxV)
-        local t = (value - minV) / (maxV - minV)
-        fill.Size = UDim2.new(t, 0, 1, 0)
-        knob.Position = UDim2.new(t, 0, 0.5, 0)
-        lbl.Text = string.format("%s: %.2f", text, value)
-        pcall(callback, value)
-    end
-
-    local function fromInput(input)
-        local w = track.AbsoluteSize.X
-        if w <= 0 then return end
-        local v = minV + math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1) * (maxV - minV)
-        setV(v)
-    end
-
-    connect(track.InputBegan, function(input)
-        if isPointer(input) then
-            dragging = true
-            fromInput(input)
-        end
-    end)
-    connect(UserInputService.InputChanged, function(input)
-        if dragging and isMove(input) then
-            fromInput(input)
-        end
-    end)
-    connect(UserInputService.InputEnded, function(input)
-        if isPointer(input) then
-            dragging = false
-        end
-    end)
-
-    return {set = setV, get = function() return value end}
-end
-
 ---------------------------------------------------------------------
 -- color picker (HSV sliders popup)
 ---------------------------------------------------------------------
@@ -1204,7 +1064,7 @@ local colorSwatches = {}
 
 local picker = new("Frame", {
     Name = "ColorPicker",
-    Size = UDim2.fromOffset(320, 300),
+    Size = UDim2.fromOffset(330, 300),
     Position = UDim2.fromScale(0.5, 0.5),
     AnchorPoint = Vector2.new(0.5, 0.5),
     BackgroundColor3 = THEME.panel,
@@ -1485,8 +1345,8 @@ end
 -- open / close menu
 ---------------------------------------------------------------------
 local opened = true
-local menuSize = 0.9
 
+-- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
     Size = UDim2.fromOffset(0, 0),
     BackgroundTransparency = 1,
@@ -1494,6 +1354,8 @@ local modalBtn = new("TextButton", {
     Modal = true,
 }, main)
 
+-- remember mouse state at the first force and restore it on close,
+-- otherwise the camera stays in Default and only rotates with RMB
 local prevMouseIcon = UserInputService.MouseIconEnabled
 local prevMouseBehavior = UserInputService.MouseBehavior
 local mouseForced = false
@@ -1506,6 +1368,8 @@ local function mouseRelease()
     end
 end
 
+-- what the game tried to set while the menu was forcing the cursor (round start etc.)
+-- our own forced values are Default / icon on, so anything else is the game's
 local gameBehavior, gameIcon = nil, nil
 connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
     if opened and mouseForced then
@@ -1526,6 +1390,7 @@ local function mouseRestore()
     local iconOn = prevMouseIcon
     if gameIcon ~= nil then iconOn = gameIcon end
     gameBehavior, gameIcon = nil, nil
+    -- first person lock: the game wants the cursor hidden and centered
     if player.CameraMode == Enum.CameraMode.LockFirstPerson then
         behavior = Enum.MouseBehavior.LockCenter
         iconOn = false
@@ -1539,7 +1404,7 @@ local function setOpen(v)
     if v then
         modalBtn.Modal = true
         main.Visible = true
-        tween(scale, {Scale = menuSize}, 0.35, Enum.EasingStyle.Back)
+        tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
     else
         closePicker()
         modalBtn.Modal = false
@@ -1665,22 +1530,23 @@ end, "espnames")
 
 addSection("Auto Skill Check")
 
-addToggle("Auto Skill Check", false, function(v)
-    SC.enabled = v
-end, "scenabled")
+addToggle("Generators", false, function(v)
+    SC.generator = v
+end, "scgen")
 
-addToggle("Perfect (off = normal)", true, function(v)
-    SC.perfect = v
-end, "scperfect")
+addToggle("Generators: perfect (off = normal)", true, function(v)
+    SC.genPerfect = v
+end, "scgenperfect")
+
+addToggle("Heal teammates", false, function(v)
+    SC.heal = v
+end, "scheal")
+
+addToggle("Heal: perfect (off = normal)", true, function(v)
+    SC.healPerfect = v
+end, "schealperfect")
 
 addSection("Settings")
-
-addSlider("Menu size", 0.6, 1.5, menuSize, function(v)
-    menuSize = v
-    if opened then
-        tween(scale, {Scale = v}, 0.1)
-    end
-end)
 
 addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
     setOpen(not opened)
@@ -1694,7 +1560,7 @@ connect(closeBtn.Activated, function()
     setOpen(false)
 end)
 
-tween(scale, {Scale = menuSize}, 0.5, Enum.EasingStyle.Back)
+tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
 -- dragging (menu window)
@@ -1730,8 +1596,9 @@ connect(RunService.RenderStepped, function(dt)
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
 
+    -- while the menu is open the cursor is visible and unlocked
     if opened then
-        mouseRelease()
+        mouseRelease() -- save game state first, then force
         if not UserInputService.MouseIconEnabled then
             UserInputService.MouseIconEnabled = true
         end
@@ -1753,7 +1620,7 @@ env.__VDEspCleanup = function()
     end
     espClear()
 
-    SC.enabled = false
+    SC.generator, SC.heal = false, false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
