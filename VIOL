@@ -518,7 +518,7 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check (generators / healing)
+-- auto skill check (generators / healing / trap)
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
@@ -586,10 +586,10 @@ local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
 local scPressDir, scPressGoal = 1, nil
 local scAutoUntil = 0                 -- while our own press is in flight, learning ignores Space
-local scLastG, scPrevLV = nil, nil    -- trap: previous needle angle on screen / previous zone source value
+local scLastG, scPrevLV = nil, nil    -- previous needle angle on screen / previous zone source value
 local scPressSrcFn, scPressSrcV = nil, nil
 local scStill, scReleasedAt = 0, 0
-local scMoveStart, scWasMoving, scReplayAt = 0, false, 0   -- trap: when the needle started moving / last remote replay
+local scMoveStart, scWasMoving = 0, false
 local scOutAlive = true
 
 local function scReset()
@@ -646,8 +646,9 @@ end
 local SC_IDS = {
     generator = {"gen"},
     heal = {"heal"},
+    trap = {"trap"},
 }
-local SC_ORDER = {"generator", "heal"}
+local SC_ORDER = {"generator", "heal", "trap"}
 
 local function scCtxFromChar()
     local chr = player.Character
@@ -664,8 +665,100 @@ local function scCtxFromChar()
     return nil
 end
 
--- trap skill checks are not handled: stay out of them completely
+---------------------------------------------------------------------
+-- trap skill check
+-- the game reports a trap escape to the server like this (seen in the F9 log):
+--   ReplicatedStorage.Remotes.Killers.<killer>.FreeTrap:FireServer("begin")
+--   ReplicatedStorage.Remotes.Killers.<killer>.TrapSkillResult:FireServer("miss" | "good" | "perfect")  x N
+--   ReplicatedStorage.Remotes.Killers.<killer>.FreeTrap:FireServer("commit")
+-- a "miss" makes the client start over with a new "begin".
+-- two layers work together:
+--   1) the needle: while a trap escape is active the normal needle logic presses Space on the perfect zone,
+--      so the client itself sees a perfect check (works without any executor hooks)
+--   2) the remote: the namecall hook (if the executor has it) tracks begin/commit and rewrites any grade the
+--      client reports to "perfect"; if the client reports nothing for TRAP_TIMEOUT seconds while an escape
+--      is active, "perfect" is sent directly
+---------------------------------------------------------------------
+local TRAP_RESULT_NAME = "TrapSkillResult"
+local TRAP_FLOW_NAME = "FreeTrap"
+local TRAP_GRADE = "perfect"
+local TRAP_TIMEOUT = 3.5      -- seconds without a client report before pups reports by itself
+local TRAP_INTERVAL = 1.2     -- minimum seconds between pups' own reports
+local TRAP_ACTIVE_MAX = 30    -- forget "escape active" after this many seconds without a commit
+local scTrapRemote = nil
+local scTrapResultAt = 0
+local scTrapActive = false
+local scTrapActiveAt = 0
+local scTrapLastFire = 0
+
+-- wipe the file left by the earlier remote-learning version (it had the wrong remote saved)
+if writefile and isfile then
+    pcall(function()
+        if isfile("vd_esp_trap_remote.json") then writefile("vd_esp_trap_remote.json", "{}") end
+    end)
+end
+
+local function scSendTrapResult()
+    local r = scTrapRemote
+    if not (r and r.Parent) then
+        r = nil
+        local rs = game:GetService("ReplicatedStorage")
+        for _, d in ipairs((rs:FindFirstChild("Remotes") or rs):GetDescendants()) do
+            if d.Name == TRAP_RESULT_NAME and d:IsA("RemoteEvent") then
+                r = d
+                break
+            end
+        end
+        scTrapRemote = r
+    end
+    if not r then return false end
+    return (pcall(function() r:FireServer(TRAP_GRADE) end))
+end
+
+local scHookOk = false
+if hookmetamethod and checkcaller and getnamecallmethod then
+    local oldNC
+    scHookOk = pcall(function()
+        oldNC = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
+            local method = getnamecallmethod()
+            if scOutAlive and method == "FireServer" and not checkcaller() and typeof(self) == "Instance" then
+                local name = self.Name
+                if name == TRAP_FLOW_NAME then
+                    local step = ...
+                    if step == "begin" then
+                        scTrapActive = true
+                        scTrapActiveAt = os.clock()
+                        if SC.trap then print("[SC] trap escape begin") end
+                    elseif step == "commit" then
+                        scTrapActive = false
+                        if SC.trap then print("[SC] trap escape commit") end
+                    end
+                elseif name == TRAP_RESULT_NAME then
+                    scTrapRemote = self
+                    scTrapResultAt = os.clock()
+                    if SC.trap then
+                        local grade = ...
+                        if type(grade) == "string" then
+                            print("[SC] trap result", grade, "->", TRAP_GRADE)
+                            if setnamecallmethod then setnamecallmethod(method) end
+                            return oldNC(self, TRAP_GRADE, select(2, ...))
+                        end
+                    end
+                end
+            end
+            return oldNC(self, ...)
+        end))
+    end)
+end
+if not scHookOk then
+    warn("[SC] trap: hookmetamethod / checkcaller / getnamecallmethod unavailable - trap uses the needle only")
+end
+
+-- trapped state: escape flow seen by the hook, or an attribute on the character / player
 local function scIsTrapped()
+    if scTrapActive and os.clock() - scTrapActiveAt < TRAP_ACTIVE_MAX then
+        return true
+    end
     local chr = player.Character
     for _, n in ipairs({"Trapped", "EscapingTrap", "InTrap", "Caught", "Stuck"}) do
         if (chr and chr:GetAttribute(n) == true) or player:GetAttribute(n) == true then
@@ -673,6 +766,21 @@ local function scIsTrapped()
         end
     end
     return false
+end
+
+-- fallback: the client reported nothing for a while during an escape -> report perfect ourselves
+local function scTrapTick()
+    if not scTrapActive then return end
+    local now = os.clock()
+    if now - scTrapActiveAt > TRAP_ACTIVE_MAX then
+        scTrapActive = false
+        return
+    end
+    local quiet = now - math.max(scTrapResultAt, scTrapActiveAt)
+    if quiet > TRAP_TIMEOUT and now - scTrapLastFire > TRAP_INTERVAL then
+        scTrapLastFire = now
+        if scSendTrapResult() then print("[SC] trap result sent (client reported none)") end
+    end
 end
 
 -- fallback: nearest object
@@ -734,69 +842,6 @@ local function scPress()
     end)
 end
 
----------------------------------------------------------------------
--- trap skill check
--- the game reports every trap skill check to the server with
---   ReplicatedStorage.Remotes.Killers.<killer>.TrapSkillResult:FireServer("miss" | "good" | "perfect")
--- (flow: FreeTrap "begin" -> TrapSkillResult x N -> FreeTrap "commit").
--- pups rewrites whatever grade the game's own client reports to "perfect". the client reports every
--- check (a miss on timeout too), so no needle / zone timing is needed. if a check is never reported,
--- pups sends "perfect" itself after TRAP_TIMEOUT seconds.
----------------------------------------------------------------------
-local TRAP_RESULT_NAME = "TrapSkillResult"
-local TRAP_GRADE = "perfect"
-local TRAP_TIMEOUT = 3.5
-local scTrapRemote = nil
-local scTrapResultAt = 0
-
--- wipe the file left by the earlier remote-learning version (it had the wrong remote saved)
-if writefile and isfile then
-    pcall(function()
-        if isfile("vd_esp_trap_remote.json") then writefile("vd_esp_trap_remote.json", "{}") end
-    end)
-end
-
-local function scSendTrapResult()
-    local r = scTrapRemote
-    if not (r and r.Parent) then
-        r = nil
-        local rs = game:GetService("ReplicatedStorage")
-        for _, d in ipairs((rs:FindFirstChild("Remotes") or rs):GetDescendants()) do
-            if d.Name == TRAP_RESULT_NAME and d:IsA("RemoteEvent") then
-                r = d
-                break
-            end
-        end
-        scTrapRemote = r
-    end
-    if not r then return false end
-    return (pcall(function() r:FireServer(TRAP_GRADE) end))
-end
-
-if hookmetamethod and checkcaller and getnamecallmethod then
-    local oldNC
-    oldNC = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
-        local method = getnamecallmethod()
-        if scOutAlive and method == "FireServer" and SC.trap and not checkcaller()
-            and typeof(self) == "Instance" and self.Name == TRAP_RESULT_NAME then
-            scTrapRemote = self
-            local now = os.clock()
-            scTrapResultAt = now
-            scMoveStart = now
-            scWasMoving = false
-            local grade = ...
-            if type(grade) == "string" then
-                print("[SC] trap result", grade, "->", TRAP_GRADE)
-                if setnamecallmethod then setnamecallmethod(method) end
-                return oldNC(self, TRAP_GRADE, select(2, ...))
-            end
-        end
-        return oldNC(self, ...)
-    end))
-else
-    warn("[SC] trap: hookmetamethod / checkcaller / getnamecallmethod missing, grade rewrite unavailable")
-end
-
 connect(player.CharacterAdded, scReset)
 do
     local pg0 = player:FindFirstChild("PlayerGui")
@@ -804,6 +849,8 @@ do
 end
 
 local function scStep(dt)
+    if SC.trap then scTrapTick() end
+
     if not (SC.generator or SC.heal or SC.trap) then
         scLast = nil
         scN, scZ = nil, nil
@@ -877,13 +924,9 @@ local function scStep(dt)
     local perfect = true
 
     if ctx == "trap" then
-        -- the grade rewrite happens in the namecall hook; this only covers a check the client never reports
-        local now = os.clock()
-        if now - scMoveStart > TRAP_TIMEOUT and scTrapResultAt < scMoveStart and now - scReplayAt > TRAP_TIMEOUT then
-            scReplayAt = now
-            if scSendTrapResult() then print("[SC] trap result sent (client reported none)") end
-        end
-        return
+        -- trap checks are always pressed on the perfect zone
+        perfect = true
+        target = scZ.Rotation + SC_CFG.perfectCenter + SC_CFG.ghExtra
     else
         if ctx == "heal" then
             perfect = SC.healPerfect
@@ -1746,6 +1789,7 @@ env.__VDEspCleanup = function()
 
     SC.generator, SC.heal, SC.trap = false, false, false
     scOutAlive = false
+    scTrapActive = false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
