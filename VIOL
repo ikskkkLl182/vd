@@ -548,7 +548,6 @@ pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
 end)
 
--- merged: one enable flag, one perfect/normal flag, instead of separate gen/heal
 local SC = {
     enabled = false,
     perfect = true, -- true = perfect (white zone), false = normal
@@ -562,10 +561,9 @@ local SC_CFG = {
     key = Enum.KeyCode.Space,
     genRange = 12,
     playerRange = 12,
-    mobileLead = 0.03,
-    -- fixed mobile tap-button path, same idea as the reference script's ActionPath/GetActionTarget
-    actionPath = "Survivor-mob.Controls.action.check",
-    touchId = 8822, -- distinct id so it doesn't collide with a real finger touch
+    mobileLead = 0.03, -- fixed, matches reference script, no UI
+    actionPath = "Survivor-mob.Controls.action.check", -- fixed mobile button path, from reference script
+    touchId = 8822,
 }
 
 local function scMakeTiming()
@@ -579,8 +577,6 @@ local function scMakeTiming()
     }
 end
 local SC_TIMING = scMakeTiming()
-
-local scMode = "tap" -- mobile press mode: "tap" (touch/mouse at the button) | "signal" (fire button signals) | "key" (Space)
 
 local function scIsMobile()
     return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
@@ -660,7 +656,6 @@ local function scFindAll()
         end
         if needle and zone then
             scN, scZ = needle, zone
-            -- fixed mobile button first (reliable on mobile, the button isn't always inside this gui)
             scB = scGetFixedButton()
             if not scB then
                 local firstBtn
@@ -761,7 +756,7 @@ local function scKeyPress()
     end
 end
 
--- mobile: screen-space center of the button, inset applied like the reference script (both X and Y)
+-- mobile: screen-space center of the button, both insets applied like the reference script
 local function scButtonCenter()
     if not (scB and scB:IsDescendantOf(game)) then return nil end
     local p, s = scB.AbsolutePosition, scB.AbsoluteSize
@@ -769,71 +764,24 @@ local function scButtonCenter()
     return p.X + s.X / 2 + inset.X, p.Y + s.Y / 2 + inset.Y
 end
 
--- mobile mode "tap": real touch at the button center, mouse click as fallback
+-- fixed-path tap, matching the reference script's TriggerMobileButton (touch, no mouse fallback)
 local function scTapButton()
     local x, y = scButtonCenter()
     if not (x and VirtualInputManager) then return false end
-    local ok = pcall(function()
+    return pcall(function()
         VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, x, y) -- 0 = Begin
-        task.wait(0.03)
+        task.wait(0.01)
         VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, x, y) -- 2 = End
     end)
-    if not ok then
-        ok = pcall(function()
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
-            task.wait(0.03)
-            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
-        end)
-    end
-    return ok
-end
-
-local function scSignalButton()
-    if not (scB and scB:IsDescendantOf(game)) then return false end
-    local fired = false
-    local sigs = {scB.MouseButton1Down, scB.MouseButton1Up, scB.MouseButton1Click, scB.Activated, scB.TouchTap}
-    for _, sig in ipairs(sigs) do
-        if firesignal then
-            if pcall(firesignal, sig) then fired = true end
-        elseif getconnections then
-            local ok = pcall(function()
-                for _, c in ipairs(getconnections(sig)) do c:Fire() end
-            end)
-            if ok then fired = true end
-        end
-    end
-    return fired
 end
 
 local function scPress()
     task.spawn(function()
         if scIsMobile() then
-            if scMode == "tap" then
-                if scTapButton() then return end
-            elseif scMode == "signal" then
-                if scSignalButton() then return end
-            end
-            scKeyPress()
-        else
-            scKeyPress()
+            if scTapButton() then return end
         end
+        scKeyPress()
     end)
-end
-
-local function scDump()
-    local pg = player:FindFirstChild("PlayerGui")
-    local g = pg and pg:FindFirstChild(SC_CFG.guiName)
-    if not g then
-        warn("[pups] " .. SC_CFG.guiName .. " not found in PlayerGui (trigger a skill check first)")
-        return
-    end
-    print("[pups] dump " .. g:GetFullName())
-    for _, d in ipairs(g:GetDescendants()) do
-        if d:IsA("GuiObject") then
-            print(string.format("[pups] %s | %s | vis=%s | pos=%s | size=%s",
-                d:GetFullName(), d.ClassName, tostring(scGuiVisible(d)), tostring(d.AbsolutePosition), tostring(d.AbsoluteSize)))
-        end
-    end
 end
 
 connect(player.CharacterAdded, scReset)
@@ -886,7 +834,6 @@ local function scStep(dt)
     scLast = rot
     if math.abs(vel) < 20 then return end
 
-    -- ctx is only used to filter out trap checks (self-unhook, chainsaw dash etc), not to gate the feature
     local ctx, rawId = scCtxFromChar()
     if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
         scCtx = scCtxProximity() or "any"
@@ -1735,7 +1682,6 @@ addToggle("Names / distance", true, function(v)
     ESP.names = v
 end, "espnames")
 
--- single merged setting: covers generator + heal skill checks on PC and mobile
 addSection("Auto Skill Check")
 
 addToggle("Auto Skill Check", false, function(v)
@@ -1749,25 +1695,6 @@ end, "scperfect")
 addSlider("Timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
     SC_TIMING.extra = v
 end)
-
-addSection("Mobile")
-
-local modeBtn
-local MODES = {"tap", "signal", "key"}
-modeBtn = addButton("Mobile press: " .. scMode, function()
-    local idx = 1
-    for i, m in ipairs(MODES) do
-        if m == scMode then idx = i end
-    end
-    scMode = MODES[(idx % #MODES) + 1]
-    modeBtn.Text = "Mobile press: " .. scMode
-end)
-
-addSlider("Mobile extra lead (ms)", 0, 100, math.floor(SC_CFG.mobileLead * 1000 + 0.5), 2, "%d ms", function(v)
-    SC_CFG.mobileLead = v / 1000
-end)
-
-addButton("Dump skill check GUI (console)", scDump)
 
 addSection("Settings")
 
