@@ -1,10 +1,11 @@
 -- pups - Violence District ESP + auto skill check (generators / healing)
--- floating icon (mobile), K key (PC), ESP color picker
+-- floating icon (mobile), K key (PC), ESP color picker, menu size slider
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -248,6 +249,31 @@ local function saveColors()
     end
     pcall(function()
         writefile(COLOR_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+---------------------------------------------------------------------
+-- ui settings (menu size, saved to file)
+---------------------------------------------------------------------
+local UI_FILE = "vd_esp_ui.json"
+local MENU_SCALE_MIN, MENU_SCALE_MAX = 0.5, 1.2
+local menuScale = 0.75 -- default: smaller than the old 1.0 (380x470 -> ~285x352)
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(UI_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(UI_FILE))
+            if type(decoded) == "table" and type(decoded.scale) == "number" then
+                menuScale = math.clamp(decoded.scale, MENU_SCALE_MIN, MENU_SCALE_MAX)
+            end
+        end
+    end)
+end
+
+local function saveUi()
+    if not writefile then return end
+    pcall(function()
+        writefile(UI_FILE, HttpService:JSONEncode({scale = menuScale}))
     end)
 end
 
@@ -543,15 +569,31 @@ local SC_CFG = {
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
-    perfectTol = 3.5,      -- tolerance for perfect hit
-    normalCenter = 127,    -- press point for normal hit (further than the white zone)
-    normalTol = 3,
-    lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
-    ghExtra = 0,           -- extra target shift (degrees). plus = press later
     genRange = 12,
     playerRange = 12,
+    mobileLead = 0.03,     -- extra lead on touch devices (input latency), seconds. only applied on mobile
 }
+
+-- per-feature timing. gen and heal are separate tables: tuning one never touches the other.
+-- defaults are the old PC values, PC behaviour is unchanged.
+local function scMakeTiming()
+    return {
+        perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
+        perfectTol = 3.5,      -- tolerance for perfect hit
+        normalCenter = 127,    -- press point for normal hit (further than the white zone)
+        normalTol = 3,
+        lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
+        extra = 0,             -- extra target shift (degrees). plus = press later
+    }
+end
+local SC_GEN = scMakeTiming()
+local SC_HEAL = scMakeTiming()
+
+local scMode = "tap" -- mobile press mode: "tap" (touch/mouse at the button) | "signal" (fire button signals) | "key" (Space)
+
+local function scIsMobile()
+    return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
+end
 
 local function scMatch(name, words)
     name = string.lower(name)
@@ -615,12 +657,18 @@ local function scFindAll()
         end
         if needle and zone then
             scN, scZ = needle, zone
+            -- mobile tap target: prefer a visible button, else the first one
+            local firstBtn
             for _, d in ipairs(g:GetDescendants()) do
                 if d:IsA("TextButton") or d:IsA("ImageButton") then
-                    scB = d
-                    break
+                    firstBtn = firstBtn or d
+                    if scGuiVisible(d) then
+                        scB = d
+                        break
+                    end
                 end
             end
+            scB = scB or firstBtn
             return true
         end
         return false
@@ -690,31 +738,103 @@ local function scCtxProximity()
     return bestKind
 end
 
--- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
+-- PC path: VirtualInputManager first (real input), firesignal only if VIM is missing / failed. unchanged.
+local function scKeyPress()
+    local sent = false
+    if VirtualInputManager then
+        sent = pcall(function()
+            VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+            task.wait(0.03)
+            VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+        end)
+    end
+    if not sent and firesignal then
+        pcall(function()
+            firesignal(UserInputService.InputBegan, {
+                KeyCode = SC_CFG.key,
+                UserInputType = Enum.UserInputType.Keyboard,
+            }, false)
+        end)
+    end
+end
+
+-- mobile: screen-space center of the skill check button (VIM coords include the top inset)
+local function scButtonCenter()
+    if not (scB and scB:IsDescendantOf(game)) then return nil end
+    local p, s = scB.AbsolutePosition, scB.AbsoluteSize
+    local sg = scB:FindFirstAncestorWhichIsA("ScreenGui")
+    local inset = (sg and sg.IgnoreGuiInset) and 0 or GuiService:GetGuiInset().Y
+    return p.X + s.X / 2, p.Y + s.Y / 2 + inset
+end
+
+-- mobile mode "tap": real touch at the button center, mouse click as fallback
+local function scTapButton()
+    local x, y = scButtonCenter()
+    if not (x and VirtualInputManager) then return false end
+    local ok = pcall(function()
+        VirtualInputManager:SendTouchEvent(1, 0, x, y) -- 0 = Begin
+        task.wait(0.03)
+        VirtualInputManager:SendTouchEvent(1, 2, x, y) -- 2 = End
+    end)
+    if not ok then
+        ok = pcall(function()
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, true, game, 1)
+            task.wait(0.03)
+            VirtualInputManager:SendMouseButtonEvent(x, y, 0, false, game, 1)
+        end)
+    end
+    return ok
+end
+
+-- mobile mode "signal": fire the button's own signals
+local function scSignalButton()
+    if not (scB and scB:IsDescendantOf(game)) then return false end
+    local fired = false
+    local sigs = {scB.MouseButton1Down, scB.MouseButton1Up, scB.MouseButton1Click, scB.Activated, scB.TouchTap}
+    for _, sig in ipairs(sigs) do
+        if firesignal then
+            if pcall(firesignal, sig) then fired = true end
+        elseif getconnections then
+            local ok = pcall(function()
+                for _, c in ipairs(getconnections(sig)) do c:Fire() end
+            end)
+            if ok then fired = true end
+        end
+    end
+    return fired
+end
+
 local function scPress()
     task.spawn(function()
-        local sent = false
-        if VirtualInputManager then
-            sent = pcall(function()
-                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
-                task.wait(0.03)
-                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
-            end)
-        end
-        if not sent and firesignal then
-            pcall(function()
-                firesignal(UserInputService.InputBegan, {
-                    KeyCode = SC_CFG.key,
-                    UserInputType = Enum.UserInputType.Keyboard,
-                }, false)
-            end)
-        end
-        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
-            pcall(function() firesignal(scB.MouseButton1Down) end)
-            pcall(function() firesignal(scB.MouseButton1Click) end)
-            pcall(function() firesignal(scB.Activated) end)
+        if scIsMobile() then
+            if scMode == "tap" then
+                if scTapButton() then return end
+            elseif scMode == "signal" then
+                if scSignalButton() then return end
+            end
+            -- "key" mode, or the chosen mode had no button / failed
+            scKeyPress()
+        else
+            scKeyPress()
         end
     end)
+end
+
+-- dumps every GuiObject under the skill check gui (path, class, visibility, abs pos/size) to the console
+local function scDump()
+    local pg = player:FindFirstChild("PlayerGui")
+    local g = pg and pg:FindFirstChild(SC_CFG.guiName)
+    if not g then
+        warn("[pups] " .. SC_CFG.guiName .. " not found in PlayerGui (trigger a skill check first)")
+        return
+    end
+    print("[pups] dump " .. g:GetFullName())
+    for _, d in ipairs(g:GetDescendants()) do
+        if d:IsA("GuiObject") then
+            print(string.format("[pups] %s | %s | vis=%s | pos=%s | size=%s",
+                d:GetFullName(), d.ClassName, tostring(scGuiVisible(d)), tostring(d.AbsolutePosition), tostring(d.AbsoluteSize)))
+        end
+    end
 end
 
 connect(player.CharacterAdded, scReset)
@@ -778,19 +898,23 @@ local function scStep(dt)
     if ctx == "trap" then return end
     if ctx ~= "any" and not SC[ctx] then return end
 
-    local perfect
-    if ctx == "heal" then
-        perfect = SC.healPerfect
+    -- gen and heal each use their own timing table + perfect flag
+    local kind = ctx
+    if kind == "any" then kind = SC.generator and "generator" or "heal" end
+    local cfg, perfect
+    if kind == "heal" then
+        cfg, perfect = SC_HEAL, SC.healPerfect
     else
-        perfect = SC.genPerfect
+        cfg, perfect = SC_GEN, SC.genPerfect
     end
 
-    local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
-    local tol = perfect and SC_CFG.perfectTol or SC_CFG.normalTol
-    local target = scZ.Rotation + center + SC_CFG.ghExtra
+    local center = perfect and cfg.perfectCenter or cfg.normalCenter
+    local tol = perfect and cfg.perfectTol or cfg.normalTol
+    local lead = cfg.lead + (scIsMobile() and SC_CFG.mobileLead or 0)
+    local target = scZ.Rotation + center + cfg.extra
 
     local diffNow = scDiff(rot, target)
-    local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
+    local diffNext = scDiff(rot + vel * (lead + dt), target)
 
     -- press when the needle crosses the target on the next frame or is already inside tolerance
     local dirNow = vel >= 0 and 1 or -1
@@ -822,6 +946,7 @@ new("UIGradient", {
     Rotation = 60,
 }, main)
 
+-- single UIScale: open/close animation goes 0 <-> menuScale (user size setting)
 local scale = new("UIScale", {Scale = 0}, main)
 
 local mainStroke = new("UIStroke", {
@@ -1055,6 +1180,110 @@ local function addButton(text, callback)
         pcall(callback)
     end)
     return btn
+end
+
+-- slider row. onChange fires live, onCommit fires once on release (use it for things that resize the menu itself)
+local function addSlider(text, minV, maxV, default, step, fmt, onChange, onCommit)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 52),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 5),
+        Size = UDim2.new(1, -100, 0, 18),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 13,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local valLbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(1, -84, 0, 5),
+        Size = UDim2.fromOffset(70, 18),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextXAlignment = Enum.TextXAlignment.Right,
+        TextColor3 = THEME.accent2,
+        Text = "",
+    }, row)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(14, 33),
+        Size = UDim2.new(1, -28, 0, 8),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+        Active = true,
+    }, row)
+    corner(track, 4)
+
+    local fill = new("Frame", {
+        Size = UDim2.fromScale(0, 1),
+        BackgroundColor3 = THEME.accent,
+        BorderSizePixel = 0,
+    }, track)
+    corner(fill, 4)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(16, 16),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 8)
+
+    local value = default
+
+    local function render()
+        local a = (value - minV) / (maxV - minV)
+        fill.Size = UDim2.fromScale(a, 1)
+        knob.Position = UDim2.fromScale(a, 0.5)
+        valLbl.Text = string.format(fmt, value)
+    end
+
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local a = math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+        local v = minV + a * (maxV - minV)
+        v = math.floor(v / step + 0.5) * step
+        v = math.clamp(v, minV, maxV)
+        if v ~= value then
+            value = v
+            render()
+            pcall(onChange, v)
+        end
+    end
+
+    local drag = false
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            drag = true
+            page.ScrollingEnabled = false -- otherwise touch drag scrolls the page instead of the slider
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if drag and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if drag and isPointer(input) then
+            drag = false
+            page.ScrollingEnabled = true
+            if onCommit then pcall(onCommit, value) end
+        end
+    end)
+
+    render()
 end
 
 ---------------------------------------------------------------------
@@ -1404,7 +1633,7 @@ local function setOpen(v)
     if v then
         modalBtn.Modal = true
         main.Visible = true
-        tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
+        tween(scale, {Scale = menuScale}, 0.35, Enum.EasingStyle.Back)
     else
         closePicker()
         modalBtn.Modal = false
@@ -1528,17 +1757,25 @@ addToggle("Names / distance", true, function(v)
     ESP.names = v
 end, "espnames")
 
-addSection("Auto Skill Check")
+-- AUTO GEN: only touches generator skill checks, own timing table (SC_GEN)
+addSection("Auto Gen")
 
-addToggle("Generators", false, function(v)
+addToggle("Auto Gen", false, function(v)
     SC.generator = v
 end, "scgen")
 
-addToggle("Generators: perfect (off = normal)", true, function(v)
+addToggle("Gen: perfect (off = normal)", true, function(v)
     SC.genPerfect = v
 end, "scgenperfect")
 
-addToggle("Heal teammates", false, function(v)
+addSlider("Gen: timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
+    SC_GEN.extra = v
+end)
+
+-- AUTO HEAL: only touches heal skill checks, own timing table (SC_HEAL)
+addSection("Auto Heal")
+
+addToggle("Auto Heal", false, function(v)
     SC.heal = v
 end, "scheal")
 
@@ -1546,7 +1783,40 @@ addToggle("Heal: perfect (off = normal)", true, function(v)
     SC.healPerfect = v
 end, "schealperfect")
 
+addSlider("Heal: timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
+    SC_HEAL.extra = v
+end)
+
+-- MOBILE: only used when the device is touch-only (no keyboard). PC path is untouched.
+addSection("Mobile")
+
+local modeBtn
+local MODES = {"tap", "signal", "key"}
+modeBtn = addButton("Mobile press: " .. scMode, function()
+    local idx = 1
+    for i, m in ipairs(MODES) do
+        if m == scMode then idx = i end
+    end
+    scMode = MODES[(idx % #MODES) + 1]
+    modeBtn.Text = "Mobile press: " .. scMode
+end)
+
+addSlider("Mobile extra lead (ms)", 0, 100, math.floor(SC_CFG.mobileLead * 1000 + 0.5), 2, "%d ms", function(v)
+    SC_CFG.mobileLead = v / 1000
+end)
+
+addButton("Dump skill check GUI (console)", scDump)
+
 addSection("Settings")
+
+addSlider("Menu size", MENU_SCALE_MIN * 100, MENU_SCALE_MAX * 100, math.floor(menuScale * 100 + 0.5), 5, "%d%%", function() end, function(v)
+    -- applied on release: resizing the menu under the finger while dragging makes the slider jitter
+    menuScale = math.clamp(v / 100, MENU_SCALE_MIN, MENU_SCALE_MAX)
+    if opened then
+        tween(scale, {Scale = menuScale}, 0.15)
+    end
+    saveUi()
+end)
 
 addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
     setOpen(not opened)
@@ -1560,7 +1830,7 @@ connect(closeBtn.Activated, function()
     setOpen(false)
 end)
 
-tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
+tween(scale, {Scale = menuScale}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
 -- dragging (menu window)
@@ -1615,6 +1885,7 @@ end)
 ---------------------------------------------------------------------
 env.__VDEspCleanup = function()
     saveColors()
+    saveUi()
     for k in pairs(ESP) do
         if k ~= "names" then ESP[k] = false end
     end
