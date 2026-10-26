@@ -257,7 +257,7 @@ end
 ---------------------------------------------------------------------
 local UI_FILE = "vd_esp_ui.json"
 local MENU_SCALE_MIN, MENU_SCALE_MAX = 0.5, 1.2
-local menuScale = 0.75 -- default: smaller than the old 1.0 (380x470 -> ~285x352)
+local menuScale = 0.75
 
 if readfile and isfile then
     pcall(function()
@@ -355,7 +355,6 @@ local function espMakeTag(part, color)
     return bb, lbl
 end
 
--- apply current colors to all existing ESP objects
 local function espApplyColors()
     for _, it in pairs(espItems) do
         local c
@@ -374,7 +373,6 @@ local function espApplyColors()
     end
 end
 
--- who is the killer: team name, attributes, or a "Killer" object in the character
 local function espIsKiller(plr)
     local team = plr.Team
     if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
@@ -445,7 +443,6 @@ local function espRefreshPlayers()
     end
 end
 
--- generators: models named "Generator" anywhere in workspace (set is kept up to date via DescendantAdded)
 local genSet = {}
 
 local function espIsGenerator(obj)
@@ -544,25 +541,19 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check (generators / healing)
+-- auto skill check (single toggle, works on PC and mobile)
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
     VirtualInputManager = game:GetService("VirtualInputManager")
 end)
 
+-- merged: one enable flag, one perfect/normal flag, instead of separate gen/heal
 local SC = {
-    generator = false,
-    heal = false,
-    genPerfect = true,   -- generators: true = perfect (white zone), false = normal
-    healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
+    enabled = false,
+    perfect = true, -- true = perfect (white zone), false = normal
 }
 
--- skill check GUI:
---   PlayerGui.SkillCheckPromptGui.Check.Line - needle
---   PlayerGui.SkillCheckPromptGui.Check.Goal - zone
---   perfect: Line.Rotation = Goal.Rotation + 104..114
---   normal : Line.Rotation = Goal.Rotation + 115 and beyond
 local SC_CFG = {
     guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
@@ -571,23 +562,23 @@ local SC_CFG = {
     key = Enum.KeyCode.Space,
     genRange = 12,
     playerRange = 12,
-    mobileLead = 0.03,     -- extra lead on touch devices (input latency), seconds. only applied on mobile
+    mobileLead = 0.03,
+    -- fixed mobile tap-button path, same idea as the reference script's ActionPath/GetActionTarget
+    actionPath = "Survivor-mob.Controls.action.check",
+    touchId = 8822, -- distinct id so it doesn't collide with a real finger touch
 }
 
--- per-feature timing. gen and heal are separate tables: tuning one never touches the other.
--- defaults are the old PC values, PC behaviour is unchanged.
 local function scMakeTiming()
     return {
-        perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
-        perfectTol = 3.5,      -- tolerance for perfect hit
-        normalCenter = 127,    -- press point for normal hit (further than the white zone)
+        perfectCenter = 111,
+        perfectTol = 3.5,
+        normalCenter = 127,
         normalTol = 3,
-        lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
-        extra = 0,             -- extra target shift (degrees). plus = press later
+        lead = 0.012,
+        extra = 0,
     }
 end
-local SC_GEN = scMakeTiming()
-local SC_HEAL = scMakeTiming()
+local SC_TIMING = scMakeTiming()
 
 local scMode = "tap" -- mobile press mode: "tap" (touch/mouse at the button) | "signal" (fire button signals) | "key" (Space)
 
@@ -617,9 +608,21 @@ local function scNorm(a)
     return a % 360
 end
 
--- shortest angle difference a - b in [-180, 180)
 local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
+end
+
+-- fixed-path mobile button, same lookup pattern as the reference script's GetActionTarget
+local function scGetFixedButton()
+    local pg = player:FindFirstChild("PlayerGui")
+    local current = pg
+    for segment in string.gmatch(SC_CFG.actionPath, "[^%.]+") do
+        current = current and current:FindFirstChild(segment)
+    end
+    if current and current:IsA("GuiObject") then
+        return current
+    end
+    return nil
 end
 
 local scN, scZ, scB = nil, nil, nil
@@ -631,7 +634,7 @@ local scStill = 0
 local function scReset()
     scN, scZ, scB = nil, nil, nil
     scLast, scPressed, scCtx, scStill = nil, false, nil, 0
-    scT = 1 -- search again right away
+    scT = 1
 end
 
 local function scFindAll()
@@ -657,18 +660,21 @@ local function scFindAll()
         end
         if needle and zone then
             scN, scZ = needle, zone
-            -- mobile tap target: prefer a visible button, else the first one
-            local firstBtn
-            for _, d in ipairs(g:GetDescendants()) do
-                if d:IsA("TextButton") or d:IsA("ImageButton") then
-                    firstBtn = firstBtn or d
-                    if scGuiVisible(d) then
-                        scB = d
-                        break
+            -- fixed mobile button first (reliable on mobile, the button isn't always inside this gui)
+            scB = scGetFixedButton()
+            if not scB then
+                local firstBtn
+                for _, d in ipairs(g:GetDescendants()) do
+                    if d:IsA("TextButton") or d:IsA("ImageButton") then
+                        firstBtn = firstBtn or d
+                        if scGuiVisible(d) then
+                            scB = d
+                            break
+                        end
                     end
                 end
+                scB = scB or firstBtn
             end
-            scB = scB or firstBtn
             return true
         end
         return false
@@ -683,8 +689,6 @@ local function scFindAll()
     end
 end
 
--- skill check id in the character -> type. add a substring here if the game uses another id.
--- "trap" is only used to recognise trap checks so they are left alone.
 local SC_IDS = {
     generator = {"gen"},
     heal = {"heal"},
@@ -707,7 +711,6 @@ local function scCtxFromChar()
     return nil
 end
 
--- fallback: nearest object
 local function scCtxProximity()
     local chr = player.Character
     local root = chr and chr:FindFirstChild("HumanoidRootPart")
@@ -758,13 +761,12 @@ local function scKeyPress()
     end
 end
 
--- mobile: screen-space center of the skill check button (VIM coords include the top inset)
+-- mobile: screen-space center of the button, inset applied like the reference script (both X and Y)
 local function scButtonCenter()
     if not (scB and scB:IsDescendantOf(game)) then return nil end
     local p, s = scB.AbsolutePosition, scB.AbsoluteSize
-    local sg = scB:FindFirstAncestorWhichIsA("ScreenGui")
-    local inset = (sg and sg.IgnoreGuiInset) and 0 or GuiService:GetGuiInset().Y
-    return p.X + s.X / 2, p.Y + s.Y / 2 + inset
+    local inset = GuiService:GetGuiInset()
+    return p.X + s.X / 2 + inset.X, p.Y + s.Y / 2 + inset.Y
 end
 
 -- mobile mode "tap": real touch at the button center, mouse click as fallback
@@ -772,9 +774,9 @@ local function scTapButton()
     local x, y = scButtonCenter()
     if not (x and VirtualInputManager) then return false end
     local ok = pcall(function()
-        VirtualInputManager:SendTouchEvent(1, 0, x, y) -- 0 = Begin
+        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, x, y) -- 0 = Begin
         task.wait(0.03)
-        VirtualInputManager:SendTouchEvent(1, 2, x, y) -- 2 = End
+        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, x, y) -- 2 = End
     end)
     if not ok then
         ok = pcall(function()
@@ -786,7 +788,6 @@ local function scTapButton()
     return ok
 end
 
--- mobile mode "signal": fire the button's own signals
 local function scSignalButton()
     if not (scB and scB:IsDescendantOf(game)) then return false end
     local fired = false
@@ -812,7 +813,6 @@ local function scPress()
             elseif scMode == "signal" then
                 if scSignalButton() then return end
             end
-            -- "key" mode, or the chosen mode had no button / failed
             scKeyPress()
         else
             scKeyPress()
@@ -820,7 +820,6 @@ local function scPress()
     end)
 end
 
--- dumps every GuiObject under the skill check gui (path, class, visibility, abs pos/size) to the console
 local function scDump()
     local pg = player:FindFirstChild("PlayerGui")
     local g = pg and pg:FindFirstChild(SC_CFG.guiName)
@@ -844,7 +843,7 @@ do
 end
 
 local function scStep(dt)
-    if not (SC.generator or SC.heal) then
+    if not SC.enabled then
         scLast = nil
         scN, scZ = nil, nil
         return
@@ -865,7 +864,6 @@ local function scStep(dt)
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
-        -- next skill check in a chain: the zone moved, or the needle jumped / went back / stopped, or timeout
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
         local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
@@ -886,9 +884,9 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then return end -- needle is not moving yet
+    if math.abs(vel) < 20 then return end
 
-    -- which skill check: character id first, then the nearest object
+    -- ctx is only used to filter out trap checks (self-unhook, chainsaw dash etc), not to gate the feature
     local ctx, rawId = scCtxFromChar()
     if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
         scCtx = scCtxProximity() or "any"
@@ -896,27 +894,15 @@ local function scStep(dt)
     ctx = ctx or scCtx
     if not ctx then return end
     if ctx == "trap" then return end
-    if ctx ~= "any" and not SC[ctx] then return end
 
-    -- gen and heal each use their own timing table + perfect flag
-    local kind = ctx
-    if kind == "any" then kind = SC.generator and "generator" or "heal" end
-    local cfg, perfect
-    if kind == "heal" then
-        cfg, perfect = SC_HEAL, SC.healPerfect
-    else
-        cfg, perfect = SC_GEN, SC.genPerfect
-    end
-
-    local center = perfect and cfg.perfectCenter or cfg.normalCenter
-    local tol = perfect and cfg.perfectTol or cfg.normalTol
-    local lead = cfg.lead + (scIsMobile() and SC_CFG.mobileLead or 0)
-    local target = scZ.Rotation + center + cfg.extra
+    local center = SC.perfect and SC_TIMING.perfectCenter or SC_TIMING.normalCenter
+    local tol = SC.perfect and SC_TIMING.perfectTol or SC_TIMING.normalTol
+    local lead = SC_TIMING.lead + (scIsMobile() and SC_CFG.mobileLead or 0)
+    local target = scZ.Rotation + center + SC_TIMING.extra
 
     local diffNow = scDiff(rot, target)
     local diffNext = scDiff(rot + vel * (lead + dt), target)
 
-    -- press when the needle crosses the target on the next frame or is already inside tolerance
     local dirNow = vel >= 0 and 1 or -1
     local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
@@ -946,7 +932,6 @@ new("UIGradient", {
     Rotation = 60,
 }, main)
 
--- single UIScale: open/close animation goes 0 <-> menuScale (user size setting)
 local scale = new("UIScale", {Scale = 0}, main)
 
 local mainStroke = new("UIStroke", {
@@ -1182,7 +1167,6 @@ local function addButton(text, callback)
     return btn
 end
 
--- slider row. onChange fires live, onCommit fires once on release (use it for things that resize the menu itself)
 local function addSlider(text, minV, maxV, default, step, fmt, onChange, onCommit)
     local row = new("Frame", {
         Size = UDim2.new(1, 0, 0, 52),
@@ -1266,7 +1250,7 @@ local function addSlider(text, minV, maxV, default, step, fmt, onChange, onCommi
     connect(track.InputBegan, function(input)
         if isPointer(input) then
             drag = true
-            page.ScrollingEnabled = false -- otherwise touch drag scrolls the page instead of the slider
+            page.ScrollingEnabled = false
             fromInput(input)
         end
     end)
@@ -1575,7 +1559,6 @@ end
 ---------------------------------------------------------------------
 local opened = true
 
--- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
     Size = UDim2.fromOffset(0, 0),
     BackgroundTransparency = 1,
@@ -1583,8 +1566,6 @@ local modalBtn = new("TextButton", {
     Modal = true,
 }, main)
 
--- remember mouse state at the first force and restore it on close,
--- otherwise the camera stays in Default and only rotates with RMB
 local prevMouseIcon = UserInputService.MouseIconEnabled
 local prevMouseBehavior = UserInputService.MouseBehavior
 local mouseForced = false
@@ -1597,8 +1578,6 @@ local function mouseRelease()
     end
 end
 
--- what the game tried to set while the menu was forcing the cursor (round start etc.)
--- our own forced values are Default / icon on, so anything else is the game's
 local gameBehavior, gameIcon = nil, nil
 connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
     if opened and mouseForced then
@@ -1619,7 +1598,6 @@ local function mouseRestore()
     local iconOn = prevMouseIcon
     if gameIcon ~= nil then iconOn = gameIcon end
     gameBehavior, gameIcon = nil, nil
-    -- first person lock: the game wants the cursor hidden and centered
     if player.CameraMode == Enum.CameraMode.LockFirstPerson then
         behavior = Enum.MouseBehavior.LockCenter
         iconOn = false
@@ -1757,37 +1735,21 @@ addToggle("Names / distance", true, function(v)
     ESP.names = v
 end, "espnames")
 
--- AUTO GEN: only touches generator skill checks, own timing table (SC_GEN)
-addSection("Auto Gen")
+-- single merged setting: covers generator + heal skill checks on PC and mobile
+addSection("Auto Skill Check")
 
-addToggle("Auto Gen", false, function(v)
-    SC.generator = v
-end, "scgen")
+addToggle("Auto Skill Check", false, function(v)
+    SC.enabled = v
+end, "scauto")
 
-addToggle("Gen: perfect (off = normal)", true, function(v)
-    SC.genPerfect = v
-end, "scgenperfect")
+addToggle("Perfect (off = normal)", true, function(v)
+    SC.perfect = v
+end, "scperfect")
 
-addSlider("Gen: timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
-    SC_GEN.extra = v
+addSlider("Timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
+    SC_TIMING.extra = v
 end)
 
--- AUTO HEAL: only touches heal skill checks, own timing table (SC_HEAL)
-addSection("Auto Heal")
-
-addToggle("Auto Heal", false, function(v)
-    SC.heal = v
-end, "scheal")
-
-addToggle("Heal: perfect (off = normal)", true, function(v)
-    SC.healPerfect = v
-end, "schealperfect")
-
-addSlider("Heal: timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
-    SC_HEAL.extra = v
-end)
-
--- MOBILE: only used when the device is touch-only (no keyboard). PC path is untouched.
 addSection("Mobile")
 
 local modeBtn
@@ -1810,7 +1772,6 @@ addButton("Dump skill check GUI (console)", scDump)
 addSection("Settings")
 
 addSlider("Menu size", MENU_SCALE_MIN * 100, MENU_SCALE_MAX * 100, math.floor(menuScale * 100 + 0.5), 5, "%d%%", function() end, function(v)
-    -- applied on release: resizing the menu under the finger while dragging makes the slider jitter
     menuScale = math.clamp(v / 100, MENU_SCALE_MIN, MENU_SCALE_MAX)
     if opened then
         tween(scale, {Scale = menuScale}, 0.15)
@@ -1866,9 +1827,8 @@ connect(RunService.RenderStepped, function(dt)
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
 
-    -- while the menu is open the cursor is visible and unlocked
     if opened then
-        mouseRelease() -- save game state first, then force
+        mouseRelease()
         if not UserInputService.MouseIconEnabled then
             UserInputService.MouseIconEnabled = true
         end
@@ -1891,7 +1851,7 @@ env.__VDEspCleanup = function()
     end
     espClear()
 
-    SC.generator, SC.heal = false, false
+    SC.enabled = false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
