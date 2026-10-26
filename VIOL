@@ -1,5 +1,5 @@
--- Violence District ESP — standalone menu
--- + плавающая иконка (телефон), кнопка K (ПК), выбор цвета ESP
+-- pups - Violence District ESP + auto skill check
+-- floating icon (mobile), K key (PC), ESP color picker
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -75,7 +75,7 @@ local function nextOrder()
 end
 
 ---------------------------------------------------------------------
--- keybinds (сохраняются в файл, если executor поддерживает)
+-- keybinds (saved to file if the executor supports it)
 ---------------------------------------------------------------------
 local SAVE_FILE = "vd_esp_binds_v2.json"
 local savedBinds = {}
@@ -206,7 +206,7 @@ connect(UserInputService.InputBegan, function(input, processed)
 end)
 
 ---------------------------------------------------------------------
--- цвета ESP (сохраняются в файл)
+-- ESP colors (saved to file)
 ---------------------------------------------------------------------
 local COLOR_FILE = "vd_esp_colors.json"
 
@@ -254,7 +254,7 @@ end
 -- gui root
 ---------------------------------------------------------------------
 local gui = new("ScreenGui", {
-    Name = "VDEspMenu",
+    Name = "pups",
     ResetOnSpawn = false,
     IgnoreGuiInset = true,
     DisplayOrder = 999,
@@ -327,7 +327,7 @@ local function espMakeTag(part, color)
     return bb, lbl
 end
 
--- применить текущие цвета ко всем уже созданным объектам ESP
+-- apply current colors to all existing ESP objects
 local function espApplyColors()
     for _, it in pairs(espItems) do
         local c
@@ -479,7 +479,7 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check
+-- auto skill check (generators / healing)
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
@@ -487,65 +487,32 @@ pcall(function()
 end)
 
 local SC = {
-    generator = false, -- генераторы
-    heal = false,      -- лечение тиммейтов
-    trap = false,      -- освобождение из капкана
-    perfect = true,    -- true = идеальное попадание (белая зона), false = обычное
+    generator = false,
+    heal = false,
+    genPerfect = true,   -- generators: true = perfect (white zone), false = normal
+    healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
 }
 
--- Структура скилчека в игре:
---   PlayerGui.SkillCheckPromptGui.Check.Line  - стрелка
---   PlayerGui.SkillCheckPromptGui.Check.Goal  - зона
---   идеальное попадание: Line.Rotation = Goal.Rotation + 104..114
---   обычное попадание:   Line.Rotation = Goal.Rotation + 115 и дальше
--- Капкан: id = "Skillcheck-player", Goal.Rotation там всегда 0 (зона не в Goal) —
--- источник зоны учится по твоим ручным попаданиям (SC_LEARN), см. ниже.
+-- skill check GUI:
+--   PlayerGui.SkillCheckPromptGui.Check.Line - needle
+--   PlayerGui.SkillCheckPromptGui.Check.Goal - zone
+--   perfect: Line.Rotation = Goal.Rotation + 104..114
+--   normal : Line.Rotation = Goal.Rotation + 115 and beyond
 local SC_CFG = {
     guiName = "SkillCheckPromptGui",
     guiWords = {"skillcheck", "skill", "check"},
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    perfectCenter = 111,   -- точка нажатия в идеальной зоне (104..114); не доводит -> +1..2, перелетает -> -1..2
-    perfectTol = 3.5,      -- допуск для идеального попадания
-    normalCenter = 127,    -- приземление ~ центр-5, т.е. ~122: заметно дальше белой (104..114). мажет мимо зоны -> -2, цепляет белую -> +2
+    perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
+    perfectTol = 3.5,      -- tolerance for perfect hit
+    normalCenter = 127,    -- press point for normal hit (further than the white zone)
     normalTol = 3,
-    lead = 0.012,          -- упреждение в секундах; не доводит -> меньше, перелетает -> больше
-    trapSign = -1,         -- капкан (Goal живой): зона зеркальная (цель = Goal - центр)
-    trapShift = 0,
-    trapExtra = -28,       -- капкан (Goal живой): сдвиг цели (градусы). минус = жмёт ПОЗЖЕ
-    trapGeoD = 0,          -- капкан, запасной режим по экрану (белый квадрат): сдвиг цели в градусах
-    ghExtra = 0,           -- гены/лечение: доп. сдвиг цели (градусы), 0 = как было изначально (идеал работал). плюс = жмёт позже
+    lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
+    ghExtra = 0,           -- extra target shift (degrees). plus = press later
     genRange = 12,
     playerRange = 12,
-    trapRange = 8,
-    learnMin = 4,          -- сколько ручных попаданий в капкане нужно, чтобы найти источник зоны
-    learnR = 0.99,         -- порог согласованности (1 = идеально; 0.99 ~ разброс 8°)
 }
-
-local LEARN_FILE = "vd_esp_trap_learn.json"
--- src = {kind, path, sign, off}: цель(needle) = sign * value(src) + off
---   kind R = GuiObject.Rotation, U = UIGradient.Rotation, G = угол элемента на экране, T = фикс. угол на экране
-local SC_LEARN = {recs = {}, src = nil}
-
-if readfile and isfile then
-    pcall(function()
-        if isfile(LEARN_FILE) then
-            local d = HttpService:JSONDecode(readfile(LEARN_FILE))
-            if type(d) == "table" and type(d.kind) == "string" and type(d.path) == "string"
-                and type(d.sign) == "number" and type(d.off) == "number" then
-                SC_LEARN.src = d
-            end
-        end
-    end)
-end
-
-local function scLearnSave(data)
-    if not writefile then return end
-    pcall(function()
-        writefile(LEARN_FILE, HttpService:JSONEncode(data or {}))
-    end)
-end
 
 local function scMatch(name, words)
     name = string.lower(name)
@@ -569,7 +536,7 @@ local function scNorm(a)
     return a % 360
 end
 
--- кратчайшая разница углов a - b в диапазоне [-180, 180)
+-- shortest angle difference a - b in [-180, 180)
 local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
 end
@@ -578,356 +545,11 @@ local scN, scZ, scB = nil, nil, nil
 local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
 local scPressDir, scPressGoal = 1, nil
-local scPressSrcFn, scPressSrcV, scLastG = nil, nil, nil
-local scHinted = false
-local scPrevLV = nil -- прошлое значение выученного источника (ждём, пока зона устоится)
-local scAutoUntil = 0 -- пока идёт наше нажатие, запись ручных не пишет
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
-    scLast, scPressed, scCtx, scLastG, scHinted, scPrevLV = nil, false, nil, nil, false, nil
-    scT = 1 -- сразу перепоиск
-end
-
--- геометрия: реальное положение элемента на экране с учётом поворота всех родителей
-local function guiCenter(o)
-    return o.AbsolutePosition + o.AbsoluteSize / 2
-end
-
-local function visCenter(o)
-    local p = guiCenter(o)
-    local a = o.Parent
-    while a and a:IsA("GuiObject") do
-        local c = guiCenter(a)
-        local r = math.rad(a.Rotation)
-        local v = p - c
-        p = c + Vector2.new(v.X * math.cos(r) - v.Y * math.sin(r), v.X * math.sin(r) + v.Y * math.cos(r))
-        a = a.Parent
-    end
-    return p
-end
-
--- угол по часовой от "вверх", градусы
-local function scAngle(p, c)
-    return math.deg(math.atan2(p.X - c.X, -(p.Y - c.Y))) % 360
-end
-
-local function scIsWhite(o)
-    if o:IsA("ImageLabel") or o:IsA("ImageButton") then
-        local c = o.ImageColor3
-        return o.ImageTransparency < 0.5 and c.R > 0.85 and c.G > 0.85 and c.B > 0.85
-    end
-    if o:IsA("Frame") then
-        local c = o.BackgroundColor3
-        return o.BackgroundTransparency < 0.5 and c.R > 0.85 and c.G > 0.85 and c.B > 0.85
-    end
-    return false
-end
-
--- check-фрейм, его центр на экране и размер
-local function scBase()
-    if not scN then return nil end
-    -- в капкане Line может лежать не прямо в Check / Check может быть нулевого размера:
-    -- поднимаемся вверх до первого GuiObject с ненулевым размером
-    local check = scN.Parent
-    while check and not (check:IsA("GuiObject") and math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y) > 0) do
-        check = check.Parent
-    end
-    if not check then return nil end
-    local size = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y)
-    return check, visCenter(check), size
-end
-
--- конец стрелки на экране (точка) либо nil
-local function scTip(c, size)
-    local tip, tipDist = nil, size * 0.15
-    local cands = scN:GetDescendants()
-    table.insert(cands, scN)
-    for _, d in ipairs(cands) do
-        if d:IsA("GuiObject") and scGuiVisible(d) then
-            local pt = visCenter(d)
-            local dist = (pt - c).Magnitude
-            if dist > tipDist then tip, tipDist = pt, dist end
-        end
-    end
-    return tip
-end
-
-local function scTipAngle(c, size)
-    local pt = scTip(c, size)
-    return pt and scAngle(pt, c) or nil
-end
-
--- белый квадрат зоны на экране (точка) либо nil
-local function scZoneWhite(check, c, size)
-    local zone, zoneArea = nil, math.huge
-    for _, d in ipairs(check:GetDescendants()) do
-        if d:IsA("GuiObject") and d ~= scN and not d:IsDescendantOf(scN)
-            and scGuiVisible(d) and scIsWhite(d) then
-            local sz = math.max(d.AbsoluteSize.X, d.AbsoluteSize.Y)
-            if sz > 0 and sz <= size * 0.3 then
-                local pt = visCenter(d)
-                if (pt - c).Magnitude > size * 0.3 then
-                    local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
-                    if area < zoneArea then zone, zoneArea = pt, area end
-                end
-            end
-        end
-    end
-    return zone
-end
-
--- возвращает: угол белого квадрата и угол конца стрелки (оба на экране), либо nil
-local function scGeom()
-    local check, c, size = scBase()
-    if not check then return nil end
-    local zone = scZoneWhite(check, c, size)
-    if not zone then return nil end
-    local tip = scTip(c, size)
-    if not tip then return nil end
-    return scAngle(zone, c), scAngle(tip, c)
-end
-
----------------------------------------------------------------------
--- обучение капкана: ищем, какой элемент в Check несёт угол зоны
----------------------------------------------------------------------
-local function scPathOf(d, root)
-    local parts = {}
-    local o = d
-    while o and o ~= root do
-        table.insert(parts, 1, o.Name)
-        o = o.Parent
-    end
-    return table.concat(parts, "/")
-end
-
-local function scResolve(root, path)
-    local o = root
-    for name in string.gmatch(path, "[^/]+") do
-        o = o and o:FindFirstChild(name)
-    end
-    return o
-end
-
--- числа вне GUI: атрибуты player/character/"Skillcheck-*" и ValueBase внутри "Skillcheck-*" (сервер может нести угол зоны там)
--- A:<tag>@<attr>  tag = player | char | sc      V:<path внутри Skillcheck-*> или V:@self
-local function scFindScInst()
-    local chr = player.Character
-    if not chr then return nil end
-    for _, c in ipairs(chr:GetChildren()) do
-        if string.find(string.lower(c.Name), "skillcheck", 1, true) then return c end
-    end
-    return nil
-end
-
-local function scExtra(vals)
-    local function addAttrs(tag, inst)
-        for k, v in pairs(inst:GetAttributes()) do
-            if type(v) == "number" then vals["A:" .. tag .. "@" .. k] = scNorm(v) end
-        end
-    end
-    addAttrs("player", player)
-    local chr = player.Character
-    if chr then addAttrs("char", chr) end
-    local sc = scFindScInst()
-    if sc then
-        addAttrs("sc", sc)
-        if sc:IsA("ValueBase") and type(sc.Value) == "number" then vals["V:@self"] = scNorm(sc.Value) end
-        for _, d in ipairs(sc:GetDescendants()) do
-            if d:IsA("ValueBase") and type(d.Value) == "number" then
-                vals["V:" .. scPathOf(d, sc)] = scNorm(d.Value)
-            end
-        end
-    end
-end
-
-local function scExtraVal(kind, path)
-    if kind == "A" then
-        local tag, k = string.match(path, "^(%w+)@(.+)$")
-        local inst
-        if tag == "player" then inst = player
-        elseif tag == "char" then inst = player.Character
-        elseif tag == "sc" then inst = scFindScInst() end
-        local v = inst and inst:GetAttribute(k)
-        return type(v) == "number" and scNorm(v) or nil
-    end
-    local sc = scFindScInst()
-    if not sc then return nil end
-    local o = (path == "@self") and sc or scResolve(sc, path)
-    if o and o:IsA("ValueBase") and type(o.Value) == "number" then return scNorm(o.Value) end
-    return nil
-end
-
--- диагностика: что реально лежит в капкане (печатается и пишется в vd_rec.txt при каждом ручном нажатии)
-local function scDiag()
-    local lines = {}
-    local p = scN and scN.Parent
-    table.insert(lines, string.format("[REC] needle=%s parent=%s(%s) parentSize=%s base=%s",
-        scN and scN:GetFullName() or "nil",
-        p and p.Name or "nil", p and p.ClassName or "nil",
-        (p and p:IsA("GuiObject")) and tostring(p.AbsoluteSize) or "-",
-        tostring(scBase() ~= nil)))
-    local sc = scFindScInst()
-    if sc then
-        table.insert(lines, "[REC] inst " .. sc.ClassName .. " " .. sc:GetFullName())
-        for k, v in pairs(sc:GetAttributes()) do
-            table.insert(lines, "[REC] inst attr " .. k .. "=" .. tostring(v))
-        end
-        for _, d in ipairs(sc:GetDescendants()) do
-            local val = d:IsA("ValueBase") and tostring(d.Value) or ""
-            table.insert(lines, "[REC] inst child " .. d.ClassName .. " " .. scPathOf(d, sc) .. " " .. val)
-        end
-    end
-    if player.Character then
-        for k, v in pairs(player.Character:GetAttributes()) do
-            table.insert(lines, "[REC] char attr " .. k .. "=" .. tostring(v))
-        end
-    end
-    for k, v in pairs(player:GetAttributes()) do
-        table.insert(lines, "[REC] player attr " .. k .. "=" .. tostring(v))
-    end
-    for _, l in ipairs(lines) do warn(l) end
-    if appendfile then pcall(appendfile, "vd_rec.txt", table.concat(lines, "\n") .. "\n") end
-end
-
--- все числа-кандидаты в Check (без стрелки): Rotation, UIGradient.Rotation, угол на экране
-local function scSnapshot(check, c, size)
-    local vals = {}
-    for _, d in ipairs(check:GetDescendants()) do
-        if d ~= scN and not d:IsDescendantOf(scN) then
-            if d:IsA("GuiObject") then
-                local path = scPathOf(d, check)
-                vals["R:" .. path] = scNorm(d.Rotation)
-                if scGuiVisible(d) then
-                    local pt = visCenter(d)
-                    if (pt - c).Magnitude > size * 0.15 then
-                        vals["G:" .. path] = scAngle(pt, c)
-                    end
-                end
-            elseif d:IsA("UIGradient") then
-                vals["U:" .. scPathOf(d, check)] = scNorm(d.Rotation)
-            end
-        end
-    end
-    vals["T:screen"] = 0
-    return vals
-end
-
-local function scSrcValue(check, c, kind, path)
-    if kind == "T" then return 0 end
-    if kind == "A" or kind == "V" then return scExtraVal(kind, path) end
-    local o = scResolve(check, path)
-    if not o then return nil end
-    if kind == "R" then
-        return o:IsA("GuiObject") and scNorm(o.Rotation) or nil
-    elseif kind == "U" then
-        return o:IsA("UIGradient") and scNorm(o.Rotation) or nil
-    elseif kind == "G" then
-        if not (o:IsA("GuiObject") and scGuiVisible(o)) then return nil end
-        return scAngle(visCenter(o), c)
-    end
-    return nil
-end
-
-local function scLearnVal()
-    local src = SC_LEARN.src
-    if not src then return nil end
-    if src.kind == "A" or src.kind == "V" then return scExtraVal(src.kind, src.path) end
-    local check, c = scBase()
-    if not check then return nil end
-    return scSrcValue(check, c, src.kind, src.path)
-end
-
--- ищет источник, у которого (needle - sign*value) одинаков во всех попаданиях
-local function scSolveWindow(list)
-    local n = #list
-    local best = nil
-    for key in pairs(list[n].vals) do
-        local kind, path = string.match(key, "^(%a):(.+)$")
-        if kind then
-            local useTip = (kind == "G" or kind == "T")
-            local ok = true
-            local vx, vy = 0, 0
-            for _, r in ipairs(list) do
-                local v = r.vals[key]
-                if v == nil or (useTip and r.tip == nil) then
-                    ok = false
-                    break
-                end
-                vx = vx + math.cos(math.rad(v))
-                vy = vy + math.sin(math.rad(v))
-            end
-            -- константный источник зону не отслеживает (кроме T: зона фиксирована на экране)
-            if ok and (kind == "T" or math.sqrt(vx * vx + vy * vy) / n < 0.98) then
-                for _, sign in ipairs(kind == "T" and {1} or {1, -1}) do
-                    local sx, sy = 0, 0
-                    for _, r in ipairs(list) do
-                        local base = useTip and r.tip or r.rot
-                        local o = math.rad(base - sign * r.vals[key])
-                        sx = sx + math.cos(o)
-                        sy = sy + math.sin(o)
-                    end
-                    local R = math.sqrt(sx * sx + sy * sy) / n
-                    local score = R + ((kind == "R" or kind == "U") and 0.0005 or 0)
-                    if R >= SC_CFG.learnR and (not best or score > best.score) then
-                        best = {
-                            kind = kind, path = path, sign = sign,
-                            off = math.deg(math.atan2(sy, sx)) % 360,
-                            score = score, R = R,
-                        }
-                    end
-                end
-            end
-        end
-    end
-    return best
-end
-
-local function scLearnSolve()
-    local recs = SC_LEARN.recs
-    local n = #recs
-    if n < SC_CFG.learnMin then
-        print(string.format("[SC] learn %d/%d - жми Space в идеал", n, SC_CFG.learnMin))
-        return
-    end
-    for k = n, SC_CFG.learnMin, -1 do
-        local list = {}
-        for i = n - k + 1, n do table.insert(list, recs[i]) end
-        local best = scSolveWindow(list)
-        if best then
-            SC_LEARN.src = {kind = best.kind, path = best.path, sign = best.sign, off = best.off}
-            scLearnSave(SC_LEARN.src)
-            print(string.format("[SC] trap learned: %s:%s sign=%d off=%.1f R=%.4f n=%d",
-                best.kind, best.path, best.sign, best.off, best.R, k))
-            return
-        end
-    end
-    print("[SC] learn: источник зоны не найден (n=" .. n .. "), жми ещё в идеал / кинь vd_rec.txt")
-end
-
-local function scLearnAdd(rot)
-    local check, c, size = scBase()
-    local vals = check and scSnapshot(check, c, size) or {}
-    scExtra(vals)
-    local rec = {
-        rot = rot,
-        tip = check and scTipAngle(c, size) or nil,
-        vals = vals,
-    }
-    table.insert(SC_LEARN.recs, rec)
-    if #SC_LEARN.recs > 8 then table.remove(SC_LEARN.recs, 1) end
-    scLearnSolve()
-end
-
-local function scSnapString(vals)
-    local keys = {}
-    for k in pairs(vals) do table.insert(keys, k) end
-    table.sort(keys)
-    local out = {}
-    for _, k in ipairs(keys) do
-        table.insert(out, string.format("%s=%.1f", k, vals[k]))
-    end
-    return table.concat(out, " ")
+    scLast, scPressed, scCtx = nil, false, nil
+    scT = 1 -- search again right away
 end
 
 local function scFindAll()
@@ -973,17 +595,13 @@ local function scFindAll()
     end
 end
 
--- точный способ: при скилчеке в персонаже появляется объект "Skillcheck-..."
--- id скилчека в персонаже -> тип. гены/лечение/капкан идут через одну таблицу и один путь
--- (один gui, одни углы, один press); тип нужен только чтобы выбрать, какой тумблер его разрешает.
--- если в игре id другой — допиши подстроку сюда, реальное имя печатается в F9 как "[SC] press ... id=".
--- капкан приходит как "Skillcheck-player" -> по id не определяется, тип берётся по близости (капкан/атрибуты).
+-- skill check id in the character -> type. add a substring here if the game uses another id
+-- (the real id is printed in F9 as "[SC] press ... id=")
 local SC_IDS = {
     generator = {"gen"},
     heal = {"heal"},
-    trap = {"trap", "free", "escape", "bear"},
 }
-local SC_ORDER = {"generator", "heal", "trap"}
+local SC_ORDER = {"generator", "heal"}
 
 local function scCtxFromChar()
     local chr = player.Character
@@ -1000,18 +618,23 @@ local function scCtxFromChar()
     return nil
 end
 
--- запасной способ: по ближайшему объекту
+-- trap skill checks are not handled: stay out of them completely
+local function scIsTrapped()
+    local chr = player.Character
+    for _, n in ipairs({"Trapped", "EscapingTrap", "InTrap", "Caught", "Stuck"}) do
+        if (chr and chr:GetAttribute(n) == true) or player:GetAttribute(n) == true then
+            return true
+        end
+    end
+    return false
+end
+
+-- fallback: nearest object
 local function scCtxProximity()
     local chr = player.Character
     local root = chr and chr:FindFirstChild("HumanoidRootPart")
     if not root then return nil end
     local pos = root.Position
-
-    for _, n in ipairs({"Trapped", "InTrap", "Caught", "Stuck"}) do
-        if chr:GetAttribute(n) == true or player:GetAttribute(n) == true then
-            return "trap"
-        end
-    end
 
     local bestKind, bestDist = nil, math.huge
     local function consider(kind, dist, range)
@@ -1021,18 +644,9 @@ local function scCtxProximity()
     end
 
     for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and not obj:FindFirstChildOfClass("Humanoid") then
-            local n = string.lower(obj.Name)
-            local kind, range
-            if n == "generator" then
-                kind, range = "generator", SC_CFG.genRange
-            elseif string.find(n, "trap", 1, true) then
-                kind, range = "trap", SC_CFG.trapRange
-            end
-            if kind then
-                local ok, cf = pcall(function() return obj:GetPivot() end)
-                if ok then consider(kind, (cf.Position - pos).Magnitude, range) end
-            end
+        if obj:IsA("Model") and string.lower(obj.Name) == "generator" and not obj:FindFirstChildOfClass("Humanoid") then
+            local ok, cf = pcall(function() return obj:GetPivot() end)
+            if ok then consider("generator", (cf.Position - pos).Magnitude, SC_CFG.genRange) end
         end
     end
 
@@ -1046,10 +660,8 @@ local function scCtxProximity()
     return bestKind
 end
 
--- VirtualInputManager первым (реальный ввод), firesignal только если VIM нет/упал:
--- firesignal на InputBegan не кидает ошибку даже когда игра фейковый InputObject игнорит
+-- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
 local function scPress()
-    scAutoUntil = os.clock() + 0.2
     task.spawn(function()
         local sent = false
         if VirtualInputManager then
@@ -1081,12 +693,8 @@ do
     if pg0 then connect(pg0.ChildAdded, scReset) end
 end
 
-local function scActive()
-    return SC.generator or SC.heal or SC.trap
-end
-
 local function scStep(dt)
-    if not scActive() then
+    if not (SC.generator or SC.heal) then
         scLast = nil
         scN, scZ = nil, nil
         return
@@ -1100,22 +708,17 @@ local function scStep(dt)
     end
 
     if stale or not scN or not scZ or not scGuiVisible(scN) then
-        scLast, scPressed, scCtx, scLastG, scHinted, scPrevLV = nil, false, nil, nil, false, nil
+        scLast, scPressed, scCtx = nil, false, nil
         return
     end
 
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
-        -- новый скилчек в цепочке (капкан даёт несколько подряд, gui при этом не скрывается):
-        -- зона сменила угол, стрелка прыгнула/пошла назад, или вышел таймаут
+        -- new skill check in a chain: zone moved, needle jumped / went back, or timeout
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
         local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
-        if scPressSrcFn and scPressSrcV then
-            local v = scPressSrcFn()
-            moved = moved or (v ~= nil and math.abs(scDiff(v, scPressSrcV)) > 1.5)
-        end
         if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2)) or waited > 0.8 then
             scPressed = false
         end
@@ -1131,9 +734,11 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then scLastG = nil return end -- стрелка ещё не движется
+    if math.abs(vel) < 20 then return end -- needle is not moving yet
 
-    -- что за скилчек: сначала точно (по персонажу), потом по близости
+    if scIsTrapped() then return end
+
+    -- which skill check: exact (character id) first, then by proximity
     local ctx, rawId = scCtxFromChar()
     if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
         scCtx = scCtxProximity() or "any"
@@ -1142,85 +747,35 @@ local function scStep(dt)
     if not ctx then return end
     if ctx ~= "any" and not SC[ctx] then return end
 
-    local cur, curVel, target, srcFn, tag = rot, vel, nil, nil, ctx
-
-    if ctx == "trap" then
-        local src = SC_LEARN.src
-        local lv = src and scLearnVal() or nil
-        if lv then
-            -- выученный источник зоны (по твоим ручным попаданиям)
-            -- первый скилчек цепочки: значение источника ещё может быть от прошлой зоны -> ждём, пока устоится
-            local stable = scPrevLV ~= nil and math.abs(scDiff(lv, scPrevLV)) < 0.5
-            scPrevLV = lv
-            if not stable or os.clock() - scSeenAt < 0.12 then return end
-            if src.kind == "G" or src.kind == "T" then
-                local check, c, size = scBase()
-                local ns = check and scTipAngle(c, size)
-                if not ns then return end
-                local g = scLastG
-                scLastG = ns
-                if not g then return end
-                cur, curVel = ns, scDiff(ns, g) / dt
-                if math.abs(curVel) < 20 then return end
-            end
-            target = scNorm(src.sign * lv + src.off)
-            if not SC.perfect then
-                -- обычное попадание: дальше идеала по ходу стрелки
-                target = target + (SC_CFG.normalCenter - SC_CFG.perfectCenter) * (curVel >= 0 and 1 or -1)
-            end
-            srcFn = scLearnVal
-            tag = "trap(learn)"
-        elseif math.abs(scDiff(scZ.Rotation, 0)) <= 0.5 then
-            -- Goal мёртвый (всегда 0): зону берём с экрана по белому квадрату
-            local zs, ns = scGeom()
-            if not (zs and ns) then
-                if not scHinted then
-                    scHinted = true
-                    warn("[SC] trap: источник зоны неизвестен. жми Space руками в идеал " .. SC_CFG.learnMin .. "+ раз - скрипт научится")
-                end
-                return
-            end
-            local g = scLastG
-            scLastG = ns
-            if not g then return end
-            cur, curVel = ns, scDiff(ns, g) / dt
-            if math.abs(curVel) < 20 then return end
-            target = (zs + SC_CFG.trapGeoD) % 360
-            srcFn = function() return (scGeom()) end
-            tag = "trap(geo)"
-        end
+    local perfect
+    if ctx == "heal" then
+        perfect = SC.healPerfect
+    else
+        perfect = SC.genPerfect
     end
 
-    if not target then
-        local center = SC.perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
-        local sign, shift = 1, 0
-        local extra = SC_CFG.ghExtra -- гены / лечение / "any"
-        if ctx == "trap" then
-            sign, shift, extra = SC_CFG.trapSign, SC_CFG.trapShift, SC_CFG.trapExtra
-        end
-        target = scZ.Rotation + shift + sign * (center + extra)
-    end
+    local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
+    local target = scZ.Rotation + center + SC_CFG.ghExtra
 
-    local diffNow = scDiff(cur, target)
-    local diffNext = scDiff(cur + curVel * (SC_CFG.lead + dt), target)
+    local diffNow = scDiff(rot, target)
+    local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
 
-    -- нажимаем, когда стрелка в следующем кадре пересечёт цель или окажется в допуске
-    local dirNow = curVel >= 0 and 1 or -1
-    local late = diffNow * dirNow > 0 and diffNow * dirNow <= (SC.perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
+    -- press when the needle crosses the target on the next frame or is already inside tolerance
+    local dirNow = vel >= 0 and 1 or -1
+    local late = diffNow * dirNow > 0 and diffNow * dirNow <= (perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
-        print("[SC] press", tag, "id=" .. tostring(rawId), "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel))
+        print("[SC] press", ctx, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
+            "cur=" .. math.floor(rot), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(vel))
         scPressed = true
         scPressTime = os.clock()
         scPressDir = vel >= 0 and 1 or -1
         scPressGoal = scZ.Rotation
-        scPressSrcFn = srcFn
-        scPressSrcV = srcFn and srcFn() or nil
         scPress()
     end
 end
 
 local function scDump()
-    print("[SC] dump через 3 секунды - запусти скилчек!")
+    print("[SC] dump in 3 seconds - trigger a skill check!")
     task.delay(3, function()
         local pg = player:FindFirstChild("PlayerGui")
         if not pg then return end
@@ -1248,8 +803,7 @@ local function scDump()
                 end
             end
         end
-        print("context(char):", scCtxFromChar(), "| context(near):", scCtxProximity())
-        print("learned:", SC_LEARN.src and (SC_LEARN.src.kind .. ":" .. SC_LEARN.src.path) or "none")
+        print("context(char):", scCtxFromChar(), "| context(near):", scCtxProximity(), "| trapped:", scIsTrapped())
         print("---- end ----")
     end)
 end
@@ -1257,45 +811,6 @@ end
 ---------------------------------------------------------------------
 -- menu window
 ---------------------------------------------------------------------
--- запись ручных попаданий: жми пробел сам во время скилчека
--- (в идеал) на капкане / гене / лечении. в F9 печатает needle/goal/diff,
--- в капкане ещё и учит источник зоны (SC_LEARN). полный снимок -> vd_rec.txt
-connect(UserInputService.InputBegan, function(input)
-    if input.KeyCode ~= SC_CFG.key or os.clock() < scAutoUntil then return end
-    if not scN or not scN:IsDescendantOf(game) or not scZ or not scZ:IsDescendantOf(game) then
-        scFindAll()
-    end
-    if not scN or not scZ or not scGuiVisible(scN) then return end
-    local ctx, rawId = scCtxFromChar()
-    ctx = ctx or scCtxProximity()
-    local rot = scNorm(scN.Rotation)
-    local goal = scNorm(scZ.Rotation)
-    local line = string.format("[REC] ctx=%s id=%s needle=%.1f goal=%.1f diff=%.1f",
-        tostring(ctx), tostring(rawId), rot, goal, (rot - goal) % 360)
-    warn(line)
-    scDiag()
-
-    local check, c, size = scBase()
-    if check then
-        local tipA = scTipAngle(c, size)
-        local zs = scGeom()
-        warn(string.format("[REC] geo zone=%s tip=%s",
-            zs and string.format("%.1f", zs) or "nil",
-            tipA and string.format("%.1f", tipA) or "nil"))
-        if appendfile then
-            pcall(appendfile, "vd_rec.txt", line .. "\n  tip=" .. tostring(tipA) .. " " .. scSnapString(scSnapshot(check, c, size)) .. "\n")
-        end
-        if ctx == "trap" then
-            scLearnAdd(rot)
-        end
-    else
-        if appendfile then pcall(appendfile, "vd_rec.txt", line .. "\n") end
-        if ctx == "trap" then
-            scLearnAdd(rot) -- без Check учимся по A:/V: источникам
-        end
-    end
-end)
-
 local main = new("Frame", {
     Name = "Main",
     Size = UDim2.fromOffset(380, 470),
@@ -1335,24 +850,24 @@ local topbar = new("Frame", {
 local title = new("TextLabel", {
     BackgroundTransparency = 1,
     Position = UDim2.fromOffset(18, 0),
-    Size = UDim2.fromOffset(60, 44),
+    Size = UDim2.fromOffset(70, 44),
     Font = Enum.Font.GothamBlack,
     TextSize = 20,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = Color3.new(1, 1, 1),
-    Text = "ESP",
+    Text = "pups",
 }, topbar)
 new("UIGradient", {Color = ColorSequence.new(THEME.accent, THEME.accent2)}, title)
 
 new("TextLabel", {
     BackgroundTransparency = 1,
-    Position = UDim2.fromOffset(66, 3),
+    Position = UDim2.fromOffset(84, 3),
     Size = UDim2.fromOffset(220, 44),
     Font = Enum.Font.GothamMedium,
     TextSize = 12,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
-    Text = "Violence District  |  K - меню",
+    Text = "Violence District  |  K - menu",
 }, topbar)
 
 local closeBtn = new("TextButton", {
@@ -1417,7 +932,7 @@ new("TextLabel", {
     TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
-    Text = "Клик по кнопке клавиши - сменить  |  Backspace - убрать  |  Esc - отмена",
+    Text = "Click key button to rebind  |  Backspace - clear  |  Esc - cancel",
 }, main)
 
 local function addSection(text)
@@ -1558,7 +1073,7 @@ local function addButton(text, callback)
 end
 
 ---------------------------------------------------------------------
--- выбор цвета (попап с HSV-слайдерами)
+-- color picker (HSV sliders popup)
 ---------------------------------------------------------------------
 local colorSwatches = {}
 
@@ -1588,7 +1103,7 @@ local pickerTitle = new("TextLabel", {
     TextSize = 14,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.text,
-    Text = "Цвет",
+    Text = "Color",
 }, picker)
 
 local preview = new("Frame", {
@@ -1734,7 +1249,7 @@ new("TextLabel", {
     TextSize = 11,
     TextXAlignment = Enum.TextXAlignment.Left,
     TextColor3 = THEME.dim,
-    Text = "ГОТОВЫЕ ЦВЕТА",
+    Text = "PRESET COLORS",
 }, picker)
 
 local PRESETS = {
@@ -1784,7 +1299,7 @@ local doneBtn = new("TextButton", {
     Size = UDim2.new(1, -32, 0, 38),
     BackgroundColor3 = THEME.accent,
     AutoButtonColor = false,
-    Text = "Готово",
+    Text = "Done",
     Font = Enum.Font.GothamBold,
     TextSize = 14,
     TextColor3 = Color3.new(1, 1, 1),
@@ -1794,7 +1309,7 @@ connect(doneBtn.Activated, closePicker)
 
 local function openPicker(key, label)
     pickKey = key
-    pickerTitle.Text = "Цвет: " .. label
+    pickerTitle.Text = "Color: " .. label
     pickerLoad(ESPColors[key])
     pickerRender()
     picker.Visible = true
@@ -1842,11 +1357,11 @@ local function addColorRow(text, key)
 end
 
 ---------------------------------------------------------------------
--- открыть / закрыть меню
+-- open / close menu
 ---------------------------------------------------------------------
 local opened = true
 
--- Modal-кнопка освобождает курсор (в том числе в режиме от первого лица)
+-- Modal button frees the cursor (including first person)
 local modalBtn = new("TextButton", {
     Size = UDim2.fromOffset(0, 0),
     BackgroundTransparency = 1,
@@ -1854,8 +1369,8 @@ local modalBtn = new("TextButton", {
     Modal = true,
 }, main)
 
--- состояние мыши запоминаем в момент первого форса и возвращаем при закрытии,
--- иначе после меню камера остаётся в Default и крутится только с ПКМ
+-- remember mouse state at the first force and restore it on close,
+-- otherwise the camera stays in Default and only rotates with RMB
 local prevMouseIcon = UserInputService.MouseIconEnabled
 local prevMouseBehavior = UserInputService.MouseBehavior
 local mouseForced = false
@@ -1893,7 +1408,7 @@ local function setOpen(v)
 end
 
 ---------------------------------------------------------------------
--- плавающая иконка (для телефона, работает и на ПК)
+-- floating icon (mobile, works on PC too)
 ---------------------------------------------------------------------
 local cam0 = workspace.CurrentCamera
 local vp0 = cam0 and cam0.ViewportSize or Vector2.new(800, 600)
@@ -1904,9 +1419,9 @@ local icon = new("TextButton", {
     Position = UDim2.fromOffset(16, math.floor(vp0.Y * 0.35)),
     BackgroundColor3 = THEME.bg,
     AutoButtonColor = false,
-    Text = "ESP",
+    Text = "pups",
     Font = Enum.Font.GothamBlack,
-    TextSize = 15,
+    TextSize = 14,
     TextColor3 = Color3.new(1, 1, 1),
     ZIndex = 20,
 }, gui)
@@ -1980,7 +1495,7 @@ addSection("Colors")
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
 
-addButton("Сбросить цвета", function()
+addButton("Reset colors", function()
     for k, v in pairs(DEFAULT_COLORS) do
         ESPColors[k] = v
         if colorSwatches[k] then
@@ -1997,26 +1512,19 @@ addToggle("Generators", false, function(v)
     SC.generator = v
 end, "scgen")
 
+addToggle("Generators: perfect (off = normal)", true, function(v)
+    SC.genPerfect = v
+end, "scgenperfect")
+
 addToggle("Heal teammates", false, function(v)
     SC.heal = v
 end, "scheal")
 
-addToggle("Trap release", false, function(v)
-    SC.trap = v
-end, "sctrap")
-
-addToggle("Perfect hit (off = normal)", true, function(v)
-    SC.perfect = v
-end, "scperfect")
+addToggle("Heal: perfect (off = normal)", true, function(v)
+    SC.healPerfect = v
+end, "schealperfect")
 
 addButton("Dump skill check GUI (3s delay, F9)", scDump)
-
-addButton("Trap learn: reset (Space в идеал 4x)", function()
-    SC_LEARN.src = nil
-    SC_LEARN.recs = {}
-    scLearnSave({})
-    print("[SC] trap learn сброшен")
-end)
 
 addSection("Settings")
 
@@ -2030,7 +1538,7 @@ end)
 
 addButton("Dump map info (console F9)", espDump)
 
-addButton("Unload ESP", function()
+addButton("Unload pups", function()
     if env.__VDEspCleanup then env.__VDEspCleanup() end
 end)
 
@@ -2041,7 +1549,7 @@ end)
 tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
 
 ---------------------------------------------------------------------
--- dragging (окно меню)
+-- dragging (menu window)
 ---------------------------------------------------------------------
 local dragging, dragStart, startPos = false, nil, nil
 
@@ -2074,9 +1582,9 @@ connect(RunService.RenderStepped, function(dt)
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
 
-    -- пока меню открыто - курсор виден и не заблокирован
+    -- while the menu is open the cursor is visible and unlocked
     if opened then
-        mouseRelease() -- сначала запоминаем состояние игры, потом форсим
+        mouseRelease() -- save game state first, then force
         if not UserInputService.MouseIconEnabled then
             UserInputService.MouseIconEnabled = true
         end
@@ -2098,7 +1606,7 @@ env.__VDEspCleanup = function()
     end
     espClear()
 
-    SC.generator, SC.heal, SC.trap = false, false, false
+    SC.generator, SC.heal = false, false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
