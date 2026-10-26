@@ -1,6 +1,5 @@
 -- pups - Violence District ESP + auto skill check (generators / healing)
 -- floating icon (mobile), K key (PC), ESP color picker
--- ОБНОВЛЕНО: исправлен мобильный авто-скиллчек на основе рабочих методов (ContextActionService + корректный SendTouchEvent)
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
