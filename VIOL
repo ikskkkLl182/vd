@@ -6,6 +6,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local HttpService = game:GetService("HttpService")
 local VirtualInputManager = game:GetService("VirtualInputManager")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 local env = (getgenv and getgenv()) or _G
@@ -216,6 +217,7 @@ local DEFAULT_COLORS = {
     killer = Color3.fromRGB(255, 60, 60),
     generators = Color3.fromRGB(255, 255, 0),
     generatorsdone = Color3.fromRGB(0, 255, 0),
+    traps = Color3.fromRGB(255, 0, 255),
 }
 
 local ESPColors = {}
@@ -289,6 +291,7 @@ local ESP = {
     survivors = false,
     killer = false,
     generators = false,
+    traps = false,
 }
 
 local function IsKiller(plr)
@@ -368,6 +371,124 @@ local function espUpdateGenerators()
     end
 end
 
+-- traps: models whose name starts with "scp" anywhere in workspace.
+-- the set is filled once at load (chunked) and kept up to date through DescendantAdded
+local trapSet, trapHls = {}, {}
+
+local function isTrapName(n)
+    return string.match(string.lower(n), "^scp") ~= nil
+end
+
+task.spawn(function()
+    local n = 0
+    for _, d in ipairs(workspace:GetDescendants()) do
+        if d:IsA("Model") and isTrapName(d.Name) then trapSet[d] = true end
+        n = n + 1
+        if n % 2000 == 0 then task.wait() end
+    end
+end)
+
+connect(workspace.DescendantAdded, function(d)
+    if d:IsA("Model") and isTrapName(d.Name) then trapSet[d] = true end
+end)
+
+local function espUpdateTraps()
+    if not ESP.traps then
+        for m, hl in pairs(trapHls) do
+            pcall(function() hl:Destroy() end)
+            trapHls[m] = nil
+        end
+        return
+    end
+    for m in pairs(trapSet) do
+        if m.Parent and m:IsDescendantOf(workspace) then
+            local torso = m:FindFirstChild("HumanoidRootPart") or m:FindFirstChild("Torso") or m.PrimaryPart
+            if torso then
+                local hl = trapHls[m]
+                if not (hl and hl.Parent) then
+                    hl = new("Highlight", {
+                        Name = "Combined_Trap_ESP",
+                        FillTransparency = 0.5,
+                        OutlineTransparency = 0,
+                    }, m)
+                    trapHls[m] = hl
+                end
+                hl.FillColor = ESPColors.traps
+                hl.OutlineColor = ESPColors.traps
+            end
+        else
+            trapSet[m] = nil
+            if trapHls[m] then
+                pcall(function() trapHls[m]:Destroy() end)
+                trapHls[m] = nil
+            end
+        end
+    end
+end
+
+---------------------------------------------------------------------
+-- anti-loop: pallet / vault remotes
+-- on enable: fires VaultEvent for every VaultTrigger and PalletSlideEvent for every PalletPointSlide
+-- in the map, then watches PalletPoint parts: when one is renamed to PalletPointSlide it fires
+-- PalletSlideEvent 0.1s later. A new Map (new round) is picked up automatically.
+---------------------------------------------------------------------
+local PAL = {block = false}
+local palletConns, palletWatched, palletMap = {}, {}, nil
+
+local function palletFireSlide(part)
+    pcall(function()
+        ReplicatedStorage.Remotes.Pallet.PalletSlideEvent:FireServer(part, true)
+    end)
+end
+
+local function palletFireVault(part)
+    pcall(function()
+        ReplicatedStorage.Remotes.Window.VaultEvent:FireServer(part, true)
+    end)
+end
+
+local function watchPallet(d)
+    if palletWatched[d] then return end
+    if d:IsA("BasePart") and d.Name == "PalletPoint" then
+        palletWatched[d] = d:GetPropertyChangedSignal("Name"):Connect(function()
+            if not PAL.block then return end
+            if d.Name == "PalletPointSlide" then
+                task.wait(0.1)
+                palletFireSlide(d)
+            end
+        end)
+    end
+end
+
+local function palletStop()
+    for _, c in ipairs(palletConns) do pcall(function() c:Disconnect() end) end
+    palletConns = {}
+    for d, c in pairs(palletWatched) do
+        pcall(function() c:Disconnect() end)
+        palletWatched[d] = nil
+    end
+    palletMap = nil
+end
+
+local function palletInit(map)
+    palletMap = map
+    for _, d in ipairs(map:GetDescendants()) do
+        if d.Name == "VaultTrigger" then palletFireVault(d) end
+        if d.Name == "PalletPointSlide" and d:IsA("BasePart") then palletFireSlide(d) end
+        watchPallet(d)
+    end
+    table.insert(palletConns, map.DescendantAdded:Connect(watchPallet))
+end
+
+local function palletTick()
+    if not PAL.block then return end
+    local map = workspace:FindFirstChild("Map")
+    if map and map ~= palletMap then
+        palletStop()
+        palletInit(map)
+    end
+end
+
 -- recolor existing highlights (color picker drag) without rescanning the map
 local function espApplyColors()
     espUpdatePlayers()
@@ -378,12 +499,19 @@ local function espApplyColors()
             hl.OutlineColor = c
         end
     end
+    for _, hl in pairs(trapHls) do
+        if hl.Parent then
+            hl.FillColor = ESPColors.traps
+            hl.OutlineColor = ESPColors.traps
+        end
+    end
 end
 
 local function espSet(flag, v)
     ESP[flag] = v
     pcall(espUpdatePlayers)
     pcall(espUpdateGenerators)
+    pcall(espUpdateTraps)
 end
 
 local espT1, espT2 = 0, 0
@@ -397,6 +525,8 @@ connect(RunService.Heartbeat, function(dt)
     if espT2 >= 1.5 then
         espT2 = 0
         if ESP.generators then pcall(espUpdateGenerators) end
+        if ESP.traps then pcall(espUpdateTraps) end
+        if PAL.block then task.spawn(palletTick) end
     end
 end)
 
@@ -1146,12 +1276,17 @@ addToggle("Generators", false, function(v)
     espSet("generators", v)
 end, "espgens")
 
+addToggle("Traps", false, function(v)
+    espSet("traps", v)
+end, "esptraps")
+
 addSection("ESP Colors")
 
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
 addColorRow("Generators", "generators")
 addColorRow("Generators done", "generatorsdone")
+addColorRow("Traps", "traps")
 
 addButton("Reset colors", function()
     for k, v in pairs(DEFAULT_COLORS) do
@@ -1169,6 +1304,17 @@ addSection("Auto Skill Check")
 addToggle("Auto skill check", false, function(v)
     SC.auto = v
 end, "scauto")
+
+addSection("Pallets / Windows")
+
+addToggle("Anti-loop (pallet + vault)", false, function(v)
+    PAL.block = v
+    if v then
+        task.spawn(palletTick)
+    else
+        palletStop()
+    end
+end, "palblock")
 
 addSection("Settings")
 
@@ -1238,9 +1384,12 @@ end)
 env.__VDEspCleanup = function()
     saveColors()
     SC.auto = false
-    ESP.survivors, ESP.killer, ESP.generators = false, false, false
+    PAL.block = false
+    pcall(palletStop)
+    ESP.survivors, ESP.killer, ESP.generators, ESP.traps = false, false, false, false
     pcall(espUpdatePlayers)
     pcall(espUpdateGenerators)
+    pcall(espUpdateTraps)
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
