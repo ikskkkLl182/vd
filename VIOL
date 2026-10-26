@@ -530,6 +530,7 @@ local SC = {
     heal = false,
     genPerfect = true,   -- generators: true = perfect (white zone), false = normal
     healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
+    trap = false,        -- trap release (always perfect, zone source is found automatically)
 }
 
 -- skill check GUI:
@@ -584,10 +585,15 @@ local scN, scZ, scB = nil, nil, nil
 local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
 local scT = 0
 local scPressDir, scPressGoal = 1, nil
+local scAutoUntil = 0                 -- while our own press is in flight, learning ignores Space
+local scLastG, scPrevLV = nil, nil    -- trap: previous needle angle on screen / previous zone source value
+local scPressSrcFn, scPressSrcV = nil, nil
+local scStill, scReleasedAt = 0, 0
+local scTrapFails, scGeoOff = 0, false
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
-    scLast, scPressed, scCtx = nil, false, nil
+    scLast, scPressed, scCtx, scLastG, scPrevLV, scStill = nil, false, nil, nil, nil, 0
     scT = 1 -- search again right away
 end
 
@@ -701,6 +707,7 @@ end
 
 -- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
 local function scPress()
+    scAutoUntil = os.clock() + 0.2
     task.spawn(function()
         local sent = false
         if VirtualInputManager then
@@ -726,6 +733,406 @@ local function scPress()
     end)
 end
 
+---------------------------------------------------------------------
+-- trap skill check
+-- Goal.Rotation stays 0 in traps, so the real zone angle lives somewhere else.
+-- pups finds where on its own: any Space press made during trap checks (yours, or
+-- another script's) is recorded, and the element/remote value that tracks the zone is
+-- solved from them. result is saved to file, no setup. a failed press (TrapFailedAt
+-- changes) is never used for learning, and a learned source that keeps failing is dropped.
+---------------------------------------------------------------------
+local LEARN_FILE = "vd_esp_trap_learn.json"
+local TRAP_CFG = {
+    learnMin = 4,      -- presses needed to find the zone source
+    learnR = 0.99,     -- consistency threshold (1 = perfect)
+    geoFailLimit = 2,  -- unlearned screen fallback is dropped after this many failed presses in a row
+    relearnFails = 4,  -- learned source is dropped after this many failed presses in a row
+}
+local SC_LEARN = {recs = {}, src = nil}
+-- src = {kind, path, sign, off}: needle target = sign * value(src) + off
+--   R = GuiObject.Rotation, U = UIGradient.Rotation, P = needle ancestor Rotation,
+--   G = element angle on screen, T = fixed screen angle,
+--   N / M / F = number received from a RemoteEvent (degrees / radians / 0..1)
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(LEARN_FILE) then
+            local d = HttpService:JSONDecode(readfile(LEARN_FILE))
+            if type(d) == "table" and type(d.kind) == "string" and type(d.path) == "string"
+                and type(d.sign) == "number" and type(d.off) == "number" then
+                SC_LEARN.src = d
+            end
+        end
+    end)
+end
+
+local function scLearnSave(data)
+    if not writefile then return end
+    pcall(function()
+        writefile(LEARN_FILE, HttpService:JSONEncode(data or {}))
+    end)
+end
+
+-- geometry: real position of an element on screen, parent rotations included
+local function guiCenter(o)
+    return o.AbsolutePosition + o.AbsoluteSize / 2
+end
+
+local function visCenter(o)
+    local p = guiCenter(o)
+    local a = o.Parent
+    while a and a:IsA("GuiObject") do
+        local c = guiCenter(a)
+        local r = math.rad(a.Rotation)
+        local v = p - c
+        p = c + Vector2.new(v.X * math.cos(r) - v.Y * math.sin(r), v.X * math.sin(r) + v.Y * math.cos(r))
+        a = a.Parent
+    end
+    return p
+end
+
+-- clockwise angle from "up", degrees
+local function scAngle(p, c)
+    return math.deg(math.atan2(p.X - c.X, -(p.Y - c.Y))) % 360
+end
+
+local function scIsWhite(o)
+    if o:IsA("ImageLabel") or o:IsA("ImageButton") then
+        local c = o.ImageColor3
+        return o.ImageTransparency < 0.5 and c.R > 0.85 and c.G > 0.85 and c.B > 0.85
+    end
+    if o:IsA("Frame") then
+        local c = o.BackgroundColor3
+        return o.BackgroundTransparency < 0.5 and c.R > 0.85 and c.G > 0.85 and c.B > 0.85
+    end
+    return false
+end
+
+-- dial frame (first ancestor of the needle with a real size), its screen center and size
+local function scBase()
+    if not scN then return nil end
+    local check = scN.Parent
+    while check and not (check:IsA("GuiObject") and math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y) > 0) do
+        check = check.Parent
+    end
+    if not check then return nil end
+    local size = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y)
+    return check, visCenter(check), size
+end
+
+local function scRoot()
+    return scN and scN:FindFirstAncestorOfClass("ScreenGui") or nil
+end
+
+local function scAncestor(k)
+    local o = scN
+    for _ = 1, k do
+        o = o and o.Parent
+    end
+    return (o and o:IsA("GuiObject")) and o or nil
+end
+
+local function scTip(c, size)
+    local tip, tipDist = nil, size * 0.15
+    local cands = scN:GetDescendants()
+    table.insert(cands, scN)
+    for _, d in ipairs(cands) do
+        if d:IsA("GuiObject") and scGuiVisible(d) then
+            local pt = visCenter(d)
+            local dist = (pt - c).Magnitude
+            if dist > tipDist then tip, tipDist = pt, dist end
+        end
+    end
+    return tip
+end
+
+local function scTipAngle(c, size)
+    local pt = scTip(c, size)
+    return pt and scAngle(pt, c) or nil
+end
+
+-- white zone marker on screen (fallback while nothing is learned)
+local function scZoneWhite(check, c, size)
+    local zone, zoneArea = nil, math.huge
+    for _, d in ipairs(check:GetDescendants()) do
+        if d:IsA("GuiObject") and d ~= scN and not d:IsDescendantOf(scN)
+            and scGuiVisible(d) and scIsWhite(d) then
+            local sz = math.max(d.AbsoluteSize.X, d.AbsoluteSize.Y)
+            if sz > 0 and sz <= size * 0.3 then
+                local pt = visCenter(d)
+                if (pt - c).Magnitude > size * 0.3 then
+                    local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
+                    if area < zoneArea then zone, zoneArea = pt, area end
+                end
+            end
+        end
+    end
+    return zone
+end
+
+-- returns white marker angle and needle tip angle (both on screen) or nil
+local function scGeom()
+    local check, c, size = scBase()
+    if not check then return nil end
+    local zone = scZoneWhite(check, c, size)
+    if not zone then return nil end
+    local tip = scTip(c, size)
+    if not tip then return nil end
+    return scAngle(zone, c), scAngle(tip, c)
+end
+
+local function scPathOf(d, root)
+    local parts = {}
+    local o = d
+    while o and o ~= root do
+        table.insert(parts, 1, o.Name)
+        o = o.Parent
+    end
+    return table.concat(parts, "/")
+end
+
+local function scResolve(root, path)
+    local o = root
+    for name in string.gmatch(path, "[^/]+") do
+        o = o and o:FindFirstChild(name)
+    end
+    return o
+end
+
+-- numbers the server sends to this client (RemoteEvent.OnClientEvent, listen only)
+local scRemote = {}
+
+local function scNoteRemote(name, ...)
+    local args = table.pack(...)
+    local now = os.clock()
+    local function put(key, v)
+        if type(v) == "number" and v == v and math.abs(v) < 1e6 then
+            scRemote["N:" .. key] = {v = scNorm(v), t = now}
+            scRemote["M:" .. key] = {v = scNorm(math.deg(v)), t = now}
+            scRemote["F:" .. key] = {v = scNorm(v * 360), t = now}
+        end
+    end
+    for i = 1, math.min(args.n, 8) do
+        local v = args[i]
+        if type(v) == "table" then
+            local n = 0
+            for k, x in pairs(v) do
+                n = n + 1
+                if n > 8 then break end
+                if type(k) == "string" or type(k) == "number" then
+                    put(name .. "#" .. i .. "." .. tostring(k), x)
+                end
+            end
+        else
+            put(name .. "#" .. i, v)
+        end
+    end
+end
+
+do
+    local RS = game:GetService("ReplicatedStorage")
+    local function hook(o)
+        if o:IsA("RemoteEvent") then
+            local ok, c = pcall(function()
+                return o.OnClientEvent:Connect(function(...)
+                    scNoteRemote(o.Name, ...)
+                end)
+            end)
+            if ok and c then table.insert(connections, c) end
+        end
+    end
+    for _, o in ipairs(RS:GetDescendants()) do hook(o) end
+    connect(RS.DescendantAdded, hook)
+end
+
+-- every number that could carry the zone angle right now
+local function scSnapshot(root, c, size)
+    local vals = {}
+    if root then
+        for _, d in ipairs(root:GetDescendants()) do
+            if d ~= scN and not d:IsDescendantOf(scN) then
+                if d:IsA("GuiObject") then
+                    local path = scPathOf(d, root)
+                    vals["R:" .. path] = scNorm(d.Rotation)
+                    if c and scGuiVisible(d) then
+                        local pt = visCenter(d)
+                        if (pt - c).Magnitude > size * 0.15 then
+                            vals["G:" .. path] = scAngle(pt, c)
+                        end
+                    end
+                elseif d:IsA("UIGradient") then
+                    vals["U:" .. scPathOf(d, root)] = scNorm(d.Rotation)
+                end
+            end
+        end
+    end
+    for k = 1, 4 do
+        local a = scAncestor(k)
+        if a then vals["P:" .. k] = scNorm(a.Rotation) end
+    end
+    local now = os.clock()
+    for key, e in pairs(scRemote) do
+        if now - e.t < 3 then vals[key] = e.v end
+    end
+    vals["T:screen"] = 0
+    return vals
+end
+
+local function scSrcValue(kind, path)
+    if kind == "T" then return 0 end
+    if kind == "N" or kind == "M" or kind == "F" then
+        local e = scRemote[kind .. ":" .. path]
+        if e and os.clock() - e.t < 3 then return e.v end
+        return nil
+    end
+    if kind == "P" then
+        local a = scAncestor(tonumber(path) or 1)
+        return a and scNorm(a.Rotation) or nil
+    end
+    local root = scRoot()
+    if not root then return nil end
+    local o = scResolve(root, path)
+    if not o then return nil end
+    if kind == "R" then
+        return o:IsA("GuiObject") and scNorm(o.Rotation) or nil
+    elseif kind == "U" then
+        return o:IsA("UIGradient") and scNorm(o.Rotation) or nil
+    elseif kind == "G" then
+        local check, c = scBase()
+        if not (check and o:IsA("GuiObject") and scGuiVisible(o)) then return nil end
+        return scAngle(visCenter(o), c)
+    end
+    return nil
+end
+
+local function scLearnVal()
+    local src = SC_LEARN.src
+    if not src then return nil end
+    return scSrcValue(src.kind, src.path)
+end
+
+-- finds the source for which (needle - sign * value) is the same at every recorded press
+local function scSolveWindow(list)
+    local n = #list
+    local best = nil
+    for key in pairs(list[n].vals) do
+        local kind, path = string.match(key, "^(%a):(.+)$")
+        if kind then
+            local useTip = (kind == "G" or kind == "T")
+            local ok = true
+            local vx, vy = 0, 0
+            for _, r in ipairs(list) do
+                local v = r.vals[key]
+                if v == nil or (useTip and r.tip == nil) then
+                    ok = false
+                    break
+                end
+                vx = vx + math.cos(math.rad(v))
+                vy = vy + math.sin(math.rad(v))
+            end
+            -- a constant source cannot track the zone (except T: the zone is fixed on screen)
+            if ok and (kind == "T" or math.sqrt(vx * vx + vy * vy) / n < 0.98) then
+                for _, sign in ipairs(kind == "T" and {1} or {1, -1}) do
+                    local sx, sy = 0, 0
+                    for _, r in ipairs(list) do
+                        local base = useTip and r.tip or r.rot
+                        local o = math.rad(base - sign * r.vals[key])
+                        sx = sx + math.cos(o)
+                        sy = sy + math.sin(o)
+                    end
+                    local R = math.sqrt(sx * sx + sy * sy) / n
+                    local pref = (kind == "R" or kind == "U" or kind == "P" or kind == "N" or kind == "M" or kind == "F") and 0.0005 or 0
+                    local score = R + pref
+                    if R >= TRAP_CFG.learnR and (not best or score > best.score) then
+                        best = {
+                            kind = kind, path = path, sign = sign,
+                            off = math.deg(math.atan2(sy, sx)) % 360,
+                            score = score, R = R,
+                        }
+                    end
+                end
+            end
+        end
+    end
+    return best
+end
+
+local function scLearnSolve()
+    local recs = SC_LEARN.recs
+    local n = #recs
+    if n < TRAP_CFG.learnMin then
+        print(string.format("[SC] trap learn %d/%d", n, TRAP_CFG.learnMin))
+        return
+    end
+    for k = n, TRAP_CFG.learnMin, -1 do
+        local list = {}
+        for i = n - k + 1, n do table.insert(list, recs[i]) end
+        local best = scSolveWindow(list)
+        if best then
+            SC_LEARN.src = {kind = best.kind, path = best.path, sign = best.sign, off = best.off}
+            scLearnSave(SC_LEARN.src)
+            scTrapFails = 0
+            print(string.format("[SC] trap learned: %s:%s sign=%d off=%.1f R=%.4f n=%d",
+                best.kind, best.path, best.sign, best.off, best.R, k))
+            return
+        end
+    end
+    print("[SC] trap learn: no source found yet (n=" .. n .. ")")
+end
+
+-- failed press = TrapFailedAt changed shortly after it
+local function scTrapWatch(tag)
+    local chr = player.Character
+    local mark = chr and chr:GetAttribute("TrapFailedAt")
+    task.delay(0.6, function()
+        local c2 = player.Character
+        local now = c2 and c2:GetAttribute("TrapFailedAt")
+        if now ~= mark then
+            scTrapFails = scTrapFails + 1
+            if SC_LEARN.src and scTrapFails >= TRAP_CFG.relearnFails then
+                print("[SC] trap: learned source keeps failing, relearning")
+                SC_LEARN.src, SC_LEARN.recs = nil, {}
+                scLearnSave({})
+                scTrapFails = 0
+                scGeoOff = false
+            elseif not SC_LEARN.src and tag == "trap(geo)" and scTrapFails >= TRAP_CFG.geoFailLimit then
+                scGeoOff = true
+                scTrapFails = 0
+                print("[SC] trap: screen fallback off, waiting to learn from presses")
+            end
+        else
+            scTrapFails = 0
+        end
+    end)
+end
+
+-- learning: any Space press during a trap check while nothing is learned
+connect(UserInputService.InputBegan, function(input)
+    if input.KeyCode ~= SC_CFG.key or os.clock() < scAutoUntil then return end
+    if not SC.trap or SC_LEARN.src or not scIsTrapped() then return end
+    pcall(function()
+        if not scN or not scN:IsDescendantOf(game) then scFindAll() end
+        if not scN or not scGuiVisible(scN) then return end
+        local rot = scNorm(scN.Rotation)
+        local check, c, size = scBase()
+        local vals = scSnapshot(scRoot(), c, size)
+        local tip = check and scTipAngle(c, size) or nil
+        local chr = player.Character
+        local mark = chr and chr:GetAttribute("TrapFailedAt")
+        task.delay(0.45, function()
+            local c2 = player.Character
+            if c2 and c2:GetAttribute("TrapFailedAt") ~= mark then
+                print("[SC] trap: that press failed, not used for learning")
+                return
+            end
+            if SC_LEARN.src then return end
+            table.insert(SC_LEARN.recs, {rot = rot, tip = tip, vals = vals})
+            if #SC_LEARN.recs > 8 then table.remove(SC_LEARN.recs, 1) end
+            scLearnSolve()
+        end)
+    end)
+end)
+
 connect(player.CharacterAdded, scReset)
 do
     local pg0 = player:FindFirstChild("PlayerGui")
@@ -733,7 +1140,7 @@ do
 end
 
 local function scStep(dt)
-    if not (SC.generator or SC.heal) then
+    if not (SC.generator or SC.heal or SC.trap) then
         scLast = nil
         scN, scZ = nil, nil
         return
@@ -747,19 +1154,27 @@ local function scStep(dt)
     end
 
     if stale or not scN or not scZ or not scGuiVisible(scN) then
-        scLast, scPressed, scCtx = nil, false, nil
+        scLast, scPressed, scCtx, scLastG, scPrevLV, scStill = nil, false, nil, nil, nil, 0
         return
     end
 
     local rot = scNorm(scN.Rotation)
 
     if scPressed then
-        -- new skill check in a chain: zone moved, needle jumped / went back, or timeout
+        -- new skill check in a chain (the gui stays up): zone changed, needle jumped / went back / stopped, or timeout
         local waited = os.clock() - scPressTime
         local step = scLast and scDiff(rot, scLast) or 0
         local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
-        if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2)) or waited > 0.8 then
+        if scPressSrcFn and scPressSrcV then
+            local v = scPressSrcFn()
+            moved = moved or (v ~= nil and math.abs(scDiff(v, scPressSrcV)) > 1.5)
+        end
+        if math.abs(step) < 20 * math.max(dt, 0.001) then scStill = scStill + 1 else scStill = 0 end
+        if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2 or scStill >= 3)) or waited > 0.8 then
             scPressed = false
+            scStill = 0
+            scPrevLV, scLastG = nil, nil
+            scReleasedAt = os.clock()
         end
         scLast = rot
         return
@@ -773,43 +1188,87 @@ local function scStep(dt)
 
     local vel = scDiff(rot, scLast) / dt
     scLast = rot
-    if math.abs(vel) < 20 then return end -- needle is not moving yet
+    if math.abs(vel) < 20 then scLastG = nil return end -- needle is not moving yet
 
-    if scIsTrapped() then return end
-
-    -- which skill check: exact (character id) first, then by proximity
+    -- which skill check: trapped state first, then the character id, then proximity
     local ctx, rawId = scCtxFromChar()
-    if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
-        scCtx = scCtxProximity() or "any"
+    if scIsTrapped() then
+        ctx = "trap"
+    else
+        if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
+            scCtx = scCtxProximity() or "any"
+        end
+        ctx = ctx or scCtx
     end
-    ctx = ctx or scCtx
     if not ctx then return end
     if ctx ~= "any" and not SC[ctx] then return end
 
-    local perfect
-    if ctx == "heal" then
-        perfect = SC.healPerfect
+    local cur, curVel, target, srcFn, tag = rot, vel, nil, nil, ctx
+    local perfect = true
+
+    if ctx == "trap" then
+        local src = SC_LEARN.src
+        local lv = src and scLearnVal() or nil
+        if lv then
+            -- learned zone source; wait until its value settles (a new check may still carry the old zone)
+            local stable = scPrevLV ~= nil and math.abs(scDiff(lv, scPrevLV)) < 0.5
+            scPrevLV = lv
+            if not stable or os.clock() - scReleasedAt < 0.08 then return end
+            if src.kind == "G" or src.kind == "T" then
+                local check, c, size = scBase()
+                local ns = check and scTipAngle(c, size)
+                if not ns then return end
+                local g = scLastG
+                scLastG = ns
+                if not g then return end
+                cur, curVel = ns, scDiff(ns, g) / dt
+                if math.abs(curVel) < 20 then return end
+            end
+            target = scNorm(src.sign * lv + src.off)
+            srcFn = scLearnVal
+            tag = "trap(learn)"
+        elseif not src and not scGeoOff and math.abs(scDiff(scZ.Rotation, 0)) <= 0.5 then
+            -- nothing learned yet: zone from the white marker on screen
+            local zs, ns = scGeom()
+            if not (zs and ns) then return end
+            local g = scLastG
+            scLastG = ns
+            if not g then return end
+            cur, curVel = ns, scDiff(ns, g) / dt
+            if math.abs(curVel) < 20 then return end
+            target = zs % 360
+            srcFn = function() return (scGeom()) end
+            tag = "trap(geo)"
+        else
+            return
+        end
     else
-        perfect = SC.genPerfect
+        if ctx == "heal" then
+            perfect = SC.healPerfect
+        else
+            perfect = SC.genPerfect
+        end
+        local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
+        target = scZ.Rotation + center + SC_CFG.ghExtra
     end
 
-    local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
-    local target = scZ.Rotation + center + SC_CFG.ghExtra
-
-    local diffNow = scDiff(rot, target)
-    local diffNext = scDiff(rot + vel * (SC_CFG.lead + dt), target)
+    local diffNow = scDiff(cur, target)
+    local diffNext = scDiff(cur + curVel * (SC_CFG.lead + dt), target)
 
     -- press when the needle crosses the target on the next frame or is already inside tolerance
-    local dirNow = vel >= 0 and 1 or -1
+    local dirNow = curVel >= 0 and 1 or -1
     local late = diffNow * dirNow > 0 and diffNow * dirNow <= (perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
-        print("[SC] press", ctx, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
-            "cur=" .. math.floor(rot), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(vel))
+        print("[SC] press", tag, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
+            "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel))
         scPressed = true
         scPressTime = os.clock()
         scPressDir = vel >= 0 and 1 or -1
         scPressGoal = scZ.Rotation
+        scPressSrcFn = srcFn
+        scPressSrcV = srcFn and srcFn() or nil
         scPress()
+        if ctx == "trap" then scTrapWatch(tag) end
     end
 end
 
@@ -1566,6 +2025,10 @@ addToggle("Heal: perfect (off = normal)", true, function(v)
     SC.healPerfect = v
 end, "schealperfect")
 
+addToggle("Trap release", false, function(v)
+    SC.trap = v
+end, "sctrap")
+
 addSection("Settings")
 
 addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
@@ -1640,7 +2103,7 @@ env.__VDEspCleanup = function()
     end
     espClear()
 
-    SC.generator, SC.heal = false, false
+    SC.generator, SC.heal, SC.trap = false, false, false
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
