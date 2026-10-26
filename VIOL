@@ -1,41 +1,754 @@
---[[
-  pups_trap_patch.lua — две замены в твоём pups-скрипте.
-  1) [FIND] функцию `scFindZoneAngle` целиком  -> [REPLACE] блоком A (+ хелпер scRingRadius над ней)
-  2) [FIND] функцию `scDumpCheck` целиком      -> [REPLACE] блоком B
+-- pups - Violence District ESP + auto skill check
+-- floating icon (mobile), K key (PC), ESP color picker
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local HttpService = game:GetService("HttpService")
 
-  почему не находило: поиск метки считал радиус кольца от размера рамки Check (size*0.25..0.75).
-  если Check больше самого кольца (или кольцо не на полкадра), метка на кольце вылетала из диапазона,
-  finder возвращал nil -> скрипт падал на фиксированную точку trapZone = первая метка, для всех следующих
-  проверок тыкал туда же. теперь радиус кольца берётся оттуда, где реально сидит стрелка (расстояние
-  её элементов от оси вращения), метка ищется на этом радиусе.
-]]
+local player = Players.LocalPlayer
+local env = (getgenv and getgenv()) or _G
 
----------------------------------------------------------------------
--- блок A
----------------------------------------------------------------------
--- радиус кольца = как далеко от оси вращения сидят элементы стрелки; запас: size/2 рамки Check
-local function scRingRadius(check)
-    local c = visCenter(scN)
-    local r = 0
-    for _, d in ipairs(scN:GetDescendants()) do
-        if d:IsA("GuiObject") and scGuiVisible(d) then
-            r = math.max(r, (visCenter(d) - c).Magnitude)
-        end
-    end
-    if r < 5 then
-        r = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y) * 0.5
-    end
-    return r, c
+if env.__VDEspCleanup then
+    pcall(env.__VDEspCleanup)
 end
 
+local connections = {}
+local function connect(signal, fn)
+    local c = signal:Connect(fn)
+    table.insert(connections, c)
+    return c
+end
+
+local THEME = {
+    bg = Color3.fromRGB(14, 14, 22),
+    panel = Color3.fromRGB(21, 21, 33),
+    item = Color3.fromRGB(30, 30, 46),
+    hover = Color3.fromRGB(44, 44, 66),
+    text = Color3.fromRGB(235, 235, 245),
+    dim = Color3.fromRGB(140, 140, 165),
+    accent = Color3.fromRGB(140, 90, 255),
+    accent2 = Color3.fromRGB(60, 200, 255),
+    off = Color3.fromRGB(58, 58, 80),
+    danger = Color3.fromRGB(255, 80, 100),
+}
+
+local function new(class, props, parent)
+    local inst = Instance.new(class)
+    if props then
+        for k, v in pairs(props) do
+            inst[k] = v
+        end
+    end
+    if parent then
+        inst.Parent = parent
+    end
+    return inst
+end
+
+local function corner(obj, radius)
+    return new("UICorner", {CornerRadius = UDim.new(0, radius)}, obj)
+end
+
+local function tween(obj, props, time, style)
+    TweenService:Create(
+        obj,
+        TweenInfo.new(time or 0.25, style or Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+        props
+    ):Play()
+end
+
+local function isPointer(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local function isMove(input)
+    return input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
+local layoutCounter = 0
+local function nextOrder()
+    layoutCounter = layoutCounter + 1
+    return layoutCounter
+end
+
+---------------------------------------------------------------------
+-- keybinds (saved to file if the executor supports it)
+---------------------------------------------------------------------
+local SAVE_FILE = "vd_esp_binds_v2.json"
+local savedBinds = {}
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(SAVE_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(SAVE_FILE))
+            if type(decoded) == "table" then
+                savedBinds = decoded
+            end
+        end
+    end)
+end
+
+local binds = {}
+local bindActions = {}
+local bindRefresh = {}
+local listeningId = nil
+
+local function saveBinds()
+    if not writefile then return end
+    local data = {}
+    for id, key in pairs(binds) do
+        data[id] = key and key.Name or ""
+    end
+    pcall(function()
+        writefile(SAVE_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+local function keyText(key)
+    if not key then return "None" end
+    local n = key.Name
+    n = string.gsub(n, "Control", "Ctrl")
+    n = string.gsub(n, "^Left", "L")
+    n = string.gsub(n, "^Right", "R")
+    return n
+end
+
+local function registerBind(id, defaultKey, action)
+    local resolved = defaultKey or false
+    local saved = savedBinds[id]
+    if type(saved) == "string" then
+        if saved == "" then
+            resolved = false
+        else
+            local ok, key = pcall(function() return Enum.KeyCode[saved] end)
+            if ok and key then resolved = key end
+        end
+    end
+    binds[id] = resolved
+    bindActions[id] = action
+end
+
+local function makeBindButton(parent, id, position)
+    local btn = new("TextButton", {
+        Size = UDim2.fromOffset(72, 24),
+        Position = position,
+        BackgroundColor3 = THEME.bg,
+        AutoButtonColor = false,
+        Text = keyText(binds[id]),
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextColor3 = THEME.accent2,
+    }, parent)
+    corner(btn, 6)
+    local st = new("UIStroke", {
+        Thickness = 1,
+        Color = THEME.off,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, btn)
+
+    local function refresh()
+        local listening = listeningId == id
+        btn.Text = listening and "..." or keyText(binds[id])
+        btn.TextColor3 = listening and THEME.text or (binds[id] and THEME.accent2 or THEME.dim)
+        tween(st, {Color = listening and THEME.accent or THEME.off}, 0.15)
+    end
+
+    bindRefresh[id] = refresh
+
+    connect(btn.Activated, function()
+        local prev = listeningId
+        if listeningId == id then
+            listeningId = nil
+        else
+            listeningId = id
+        end
+        if prev and bindRefresh[prev] then bindRefresh[prev]() end
+        refresh()
+    end)
+
+    refresh()
+end
+
+connect(UserInputService.InputBegan, function(input, processed)
+    if listeningId then
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+        local id = listeningId
+        listeningId = nil
+        if input.KeyCode == Enum.KeyCode.Escape then
+        elseif input.KeyCode == Enum.KeyCode.Backspace then
+            binds[id] = false
+        else
+            for otherId, key in pairs(binds) do
+                if otherId ~= id and key == input.KeyCode then
+                    binds[otherId] = false
+                    if bindRefresh[otherId] then bindRefresh[otherId]() end
+                end
+            end
+            binds[id] = input.KeyCode
+        end
+        if bindRefresh[id] then bindRefresh[id]() end
+        saveBinds()
+        return
+    end
+
+    if processed then return end
+    if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+    for id, key in pairs(binds) do
+        if key and key == input.KeyCode then
+            local action = bindActions[id]
+            if action then pcall(action) end
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- ESP colors (saved to file)
+---------------------------------------------------------------------
+local COLOR_FILE = "vd_esp_colors.json"
+
+local DEFAULT_COLORS = {
+    survivors = Color3.fromRGB(80, 255, 130),
+    killer = Color3.fromRGB(255, 60, 60),
+    generators = Color3.fromRGB(255, 220, 60),
+}
+
+local ESPColors = {}
+for k, v in pairs(DEFAULT_COLORS) do
+    ESPColors[k] = v
+end
+
+if readfile and isfile then
+    pcall(function()
+        if isfile(COLOR_FILE) then
+            local decoded = HttpService:JSONDecode(readfile(COLOR_FILE))
+            if type(decoded) == "table" then
+                for k, t in pairs(decoded) do
+                    if DEFAULT_COLORS[k] and type(t) == "table" and #t == 3 then
+                        ESPColors[k] = Color3.fromRGB(t[1], t[2], t[3])
+                    end
+                end
+            end
+        end
+    end)
+end
+
+local function saveColors()
+    if not writefile then return end
+    local data = {}
+    for k, c in pairs(ESPColors) do
+        data[k] = {
+            math.floor(c.R * 255 + 0.5),
+            math.floor(c.G * 255 + 0.5),
+            math.floor(c.B * 255 + 0.5),
+        }
+    end
+    pcall(function()
+        writefile(COLOR_FILE, HttpService:JSONEncode(data))
+    end)
+end
+
+---------------------------------------------------------------------
+-- gui root
+---------------------------------------------------------------------
+local gui = new("ScreenGui", {
+    Name = "pups",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    DisplayOrder = 999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+})
+
+local function mount()
+    local targets = {
+        function() return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5) end,
+        function() return gethui and gethui() end,
+        function() return game:GetService("CoreGui") end,
+    }
+    for _, get in ipairs(targets) do
+        local ok, parent = pcall(get)
+        if ok and parent then
+            local ok2 = pcall(function() gui.Parent = parent end)
+            if ok2 and gui.Parent then return end
+        end
+    end
+end
+mount()
+
+---------------------------------------------------------------------
+-- ESP
+---------------------------------------------------------------------
+local espFolder = new("Folder", {Name = "ESP"}, gui)
+
+local ESP = {
+    survivors = false,
+    killer = false,
+    generators = false,
+    names = true,
+}
+
+local espItems = {}
+
+local function espRemove(key)
+    local it = espItems[key]
+    if not it then return end
+    espItems[key] = nil
+    pcall(function() if it.hl then it.hl:Destroy() end end)
+    pcall(function() it.bb:Destroy() end)
+end
+
+local function espClear(filter)
+    for key, it in pairs(espItems) do
+        if not filter or filter(it) then
+            espRemove(key)
+        end
+    end
+end
+
+local function espMakeTag(part, color)
+    local bb = new("BillboardGui", {
+        Adornee = part,
+        AlwaysOnTop = true,
+        Size = UDim2.fromOffset(150, 22),
+        StudsOffset = Vector3.new(0, 3, 0),
+        LightInfluence = 0,
+        ResetOnSpawn = false,
+    }, espFolder)
+    local lbl = new("TextLabel", {
+        BackgroundTransparency = 1,
+        Size = UDim2.fromScale(1, 1),
+        Font = Enum.Font.GothamBold,
+        TextSize = 13,
+        TextColor3 = color,
+        TextStrokeTransparency = 0.3,
+        Text = "",
+    }, bb)
+    return bb, lbl
+end
+
+-- apply current colors to all existing ESP objects
+local function espApplyColors()
+    for _, it in pairs(espItems) do
+        local c
+        if it.kind == "player" then
+            c = it.killer and ESPColors.killer or ESPColors.survivors
+        else
+            c = ESPColors[it.cat]
+        end
+        if c then
+            if it.hl then
+                it.hl.FillColor = c
+                it.hl.OutlineColor = c
+            end
+            it.lbl.TextColor3 = c
+        end
+    end
+end
+
+-- who is the killer: team name, attributes, or a "Killer" object in the character
+local function espIsKiller(plr)
+    local team = plr.Team
+    if team and string.find(string.lower(team.Name), "kill", 1, true) then return true end
+
+    local function check(inst)
+        for _, name in ipairs({"Killer", "IsKiller", "killer", "Role", "role", "Team", "team"}) do
+            local v = inst:GetAttribute(name)
+            if v == true and string.find(string.lower(name), "kill", 1, true) then return true end
+            if type(v) == "string" and string.find(string.lower(v), "kill", 1, true) then return true end
+        end
+        return false
+    end
+
+    if check(plr) then return true end
+    local chr = plr.Character
+    if chr then
+        if check(chr) then return true end
+        if chr:FindFirstChild("Killer") then return true end
+    end
+    return false
+end
+
+local function espRefreshPlayers()
+    local alive = {}
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not string.find(plr.Team and string.lower(plr.Team.Name) or "", "spect", 1, true) then
+            local killer = espIsKiller(plr)
+            local want = (killer and ESP.killer) or ((not killer) and ESP.survivors)
+            local chr = plr.Character
+            local root = chr and chr:FindFirstChild("HumanoidRootPart")
+            local hum = chr and chr:FindFirstChildOfClass("Humanoid")
+            if want and chr and root and (not hum or hum.Health > 0) then
+                alive[plr] = true
+                local color = killer and ESPColors.killer or ESPColors.survivors
+                local it = espItems[plr]
+                if it and (it.chr ~= chr or it.killer ~= killer) then
+                    espRemove(plr)
+                    it = nil
+                end
+                if not it then
+                    local hl = new("Highlight", {
+                        Adornee = chr,
+                        FillColor = color,
+                        OutlineColor = color,
+                        FillTransparency = 0.65,
+                        OutlineTransparency = 0,
+                        DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                    }, espFolder)
+                    local bb, lbl = espMakeTag(root, color)
+                    espItems[plr] = {
+                        kind = "player",
+                        chr = chr,
+                        killer = killer,
+                        part = root,
+                        hl = hl,
+                        bb = bb,
+                        lbl = lbl,
+                        text = plr.DisplayName .. (killer and " (KILLER)" or ""),
+                    }
+                end
+            end
+        end
+    end
+    for key, it in pairs(espItems) do
+        if it.kind == "player" and not alive[key] then
+            espRemove(key)
+        end
+    end
+end
+
+-- generators: models named "Generator" anywhere in workspace (set is kept up to date via DescendantAdded)
+local genSet = {}
+
+local function espIsGenerator(obj)
+    return obj:IsA("Model") and string.lower(obj.Name) == "generator"
+end
+
+for _, obj in ipairs(workspace:GetDescendants()) do
+    if espIsGenerator(obj) then genSet[obj] = true end
+end
+
+connect(workspace.DescendantAdded, function(obj)
+    if espIsGenerator(obj) then genSet[obj] = true end
+end)
+
+local function espRefreshGenerators()
+    local alive = {}
+    if ESP.generators then
+        for model in pairs(genSet) do
+            if model.Parent then
+                local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
+                if part then
+                    alive[model] = true
+                    local it = espItems[model]
+                    if it and it.part ~= part then
+                        espRemove(model)
+                        it = nil
+                    end
+                    if not it then
+                        local color = ESPColors.generators
+                        local hl = new("Highlight", {
+                            Adornee = model,
+                            FillColor = color,
+                            OutlineColor = color,
+                            FillTransparency = 0.65,
+                            OutlineTransparency = 0,
+                            DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
+                        }, espFolder)
+                        local bb, lbl = espMakeTag(part, color)
+                        espItems[model] = {
+                            kind = "object",
+                            cat = "generators",
+                            part = part,
+                            hl = hl,
+                            bb = bb,
+                            lbl = lbl,
+                            text = "Generator",
+                        }
+                    end
+                end
+            else
+                genSet[model] = nil
+            end
+        end
+    end
+    for key, it in pairs(espItems) do
+        if it.cat == "generators" and not alive[key] then
+            espRemove(key)
+        end
+    end
+end
+
+local function espSet(flag, v)
+    ESP[flag] = v
+    espRefreshPlayers()
+    espRefreshGenerators()
+end
+
+local espT1, espT2 = 0, 0
+connect(RunService.Heartbeat, function(dt)
+    espT1 = espT1 + dt
+    espT2 = espT2 + dt
+
+    if espT1 >= 0.1 then
+        espT1 = 0
+        local cam = workspace.CurrentCamera
+        if cam then
+            local cp = cam.CFrame.Position
+            for _, it in pairs(espItems) do
+                local part = it.part
+                if part and part.Parent then
+                    if ESP.names then
+                        it.lbl.Text = string.format("%s [%d]", it.extra and it.extra() or it.text, math.floor((cp - part.Position).Magnitude))
+                    else
+                        it.lbl.Text = ""
+                    end
+                end
+            end
+        end
+    end
+
+    if espT2 >= 0.5 then
+        espT2 = 0
+        if ESP.survivors or ESP.killer then espRefreshPlayers() end
+        if ESP.generators then espRefreshGenerators() end
+    end
+end)
+
+---------------------------------------------------------------------
+-- auto skill check (generators / healing / trap)
+---------------------------------------------------------------------
+local VirtualInputManager = nil
+pcall(function()
+    VirtualInputManager = game:GetService("VirtualInputManager")
+end)
+
+-- log: console + the "Log" box in the menu (many executors send print() of scripts to their own console,
+-- not to F9, so the menu box is the reliable place to read it)
+local scLogLines, scLogAll, scLogLabel = {}, {}, nil
+local function scLog(...)
+    local parts = {}
+    for i = 1, select("#", ...) do
+        parts[i] = tostring((select(i, ...)))
+    end
+    local line = table.concat(parts, " ")
+    pcall(print, line)
+    table.insert(scLogAll, line)
+    if #scLogAll > 300 then table.remove(scLogAll, 1) end
+    table.insert(scLogLines, line)
+    if #scLogLines > 12 then table.remove(scLogLines, 1) end
+    if scLogLabel then
+        pcall(function() scLogLabel.Text = table.concat(scLogLines, "\n") end)
+    end
+end
+
+local SC = {
+    generator = false,
+    heal = false,
+    genPerfect = true,   -- generators: true = perfect (white zone), false = normal
+    healPerfect = true,  -- healing:    true = perfect (white zone), false = normal
+    trap = false,        -- trap release (always perfect)
+    trapSpoof = true,    -- trap: hand the game the zone angle when it reads the needle (any press = perfect)
+}
+
+-- skill check GUI:
+--   PlayerGui.SkillCheckPromptGui.Check.Line - needle
+--   PlayerGui.SkillCheckPromptGui.Check.Goal - zone
+--   perfect: Line.Rotation = Goal.Rotation + 104..114
+--   normal : Line.Rotation = Goal.Rotation + 115 and beyond
+-- trap checks: Goal.Rotation stays 0, the zone is a white mark on the ring (its position changes every check).
+-- The mark comes in two looks: a small white square, or an outlined bar with a solid white end.
+local SC_CFG = {
+    guiName = "SkillCheckPromptGui",
+    guiWords = {"skillcheck", "skill", "check"},
+    needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
+    zoneWords = {"goal", "zone", "success", "target"},
+    key = Enum.KeyCode.Space,
+    perfectCenter = 111,   -- press point inside the perfect zone (104..114); late -> +1..2, early -> -1..2
+    perfectTol = 3.5,      -- tolerance for perfect hit
+    normalCenter = 127,    -- press point for normal hit (further than the white zone)
+    normalTol = 3,
+    lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
+    ghExtra = 0,           -- extra target shift (degrees). plus = press later
+    trapOffset = 8,        -- trap: START value of the press point past the zone centre (it calibrates itself, see below)
+    trapTol = 3.5,         -- trap: tolerance for the press
+    trapZone = -75,        -- trap fallback (zone mark not found): fixed point, only right for the first check
+    genRange = 12,
+    playerRange = 12,
+}
+
+local function scMatch(name, words)
+    name = string.lower(name)
+    for _, w in ipairs(words) do
+        if string.find(name, w, 1, true) then return true end
+    end
+    return false
+end
+
+local function scGuiVisible(obj)
+    local p = obj
+    while p do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") and not p.Enabled then return false end
+        p = p.Parent
+    end
+    return true
+end
+
+local function scNorm(a)
+    return a % 360
+end
+
+-- shortest angle difference a - b in [-180, 180)
+local function scDiff(a, b)
+    return ((a - b + 180) % 360) - 180
+end
+
+-- real position of a gui element on screen, with the rotation of all its parents applied
+local function guiCenter(o)
+    return o.AbsolutePosition + o.AbsoluteSize / 2
+end
+
+local function visCenter(o)
+    local p = guiCenter(o)
+    local a = o.Parent
+    while a and a:IsA("GuiObject") do
+        local c = guiCenter(a)
+        local r = math.rad(a.Rotation)
+        local v = p - c
+        p = c + Vector2.new(v.X * math.cos(r) - v.Y * math.sin(r), v.X * math.sin(r) + v.Y * math.cos(r))
+        a = a.Parent
+    end
+    return p
+end
+
+-- angle clockwise from "up", degrees (same convention as GuiObject.Rotation)
+local function scAngle(p, c)
+    return math.deg(math.atan2(p.X - c.X, -(p.Y - c.Y))) % 360
+end
+
+local function scBright(c)
+    return c.R > 0.75 and c.G > 0.75 and c.B > 0.75
+end
+
+-- solid white element (filled frame or tinted image)
+local function scIsWhite(o)
+    if (o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.ImageTransparency < 0.5 and scBright(o.ImageColor3) then
+        return true
+    end
+    if o:IsA("GuiObject") and o.BackgroundTransparency < 0.5 and scBright(o.BackgroundColor3) then
+        return true
+    end
+    return false
+end
+
+-- element drawn only as a white outline (UIStroke), like the long bar of the second zone look
+local function scIsOutline(o)
+    for _, ch in ipairs(o:GetChildren()) do
+        if ch:IsA("UIStroke") and ch.Enabled and ch.Thickness > 0 and ch.Transparency < 0.5 and scBright(ch.Color) then
+            return true
+        end
+    end
+    return false
+end
+
+-- 3 = solid bright element, 2 = bright outline only, 1 = any other visible small element, 0 = invisible
+local function scVisKind(o)
+    if scIsWhite(o) then return 3 end
+    if scIsOutline(o) then return 2 end
+    if (o:IsA("ImageLabel") or o:IsA("ImageButton")) and o.ImageTransparency < 0.9 and o.Image ~= "" then return 1 end
+    if o.BackgroundTransparency < 0.9 then return 1 end
+    return 0
+end
+
+local scN, scZ, scB = nil, nil, nil
+local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
+local scT = 0
+local scPressDir, scPressGoal = 1, nil
+local scAutoUntil = 0                 -- while our own press is in flight, learning ignores Space
+local scLastG, scPrevLV = nil, nil    -- previous needle angle on screen / previous zone source value
+local scPressSrcFn, scPressSrcV = nil, nil
+local scStill, scReleasedAt = 0, 0
+local scMoveStart, scWasMoving = 0, false
+local scOutAlive = true
+-- trap chain state
+local scZoneObj, scZoneScanAt, scZoneKind = nil, 0, 0   -- cached zone mark
+local scLastZone, scZoneSame = nil, 0    -- last zone angle / frames it stayed the same
+local scPressZone = nil                  -- zone angle we pressed for (to see when the next check starts)
+local scZoneEverFound = false
+local scTrapWarned = false
+local scNoZoneDumped = false             -- dumped the gui once for this check because no zone mark was found
+local scTrapLatchUntil = 0               -- keeps "this is a trap check" for a few seconds between checks
+-- press point past the zone centre; corrected after every press (see the Space listener below)
+local scTrapOffset = env.__VDTrapOffset or SC_CFG.trapOffset
+local scEvalPending = nil                -- {zone, dir, t} of the last trap press, waiting for its input event
+
+local function scReset()
+    scN, scZ, scB = nil, nil, nil
+    scLast, scPressed, scCtx, scLastG, scPrevLV, scStill = nil, false, nil, nil, nil, 0
+    scLastZone, scZoneSame, scPressZone, scZoneObj = nil, 0, nil, nil
+    scNoZoneDumped = false
+    scT = 1 -- search again right away
+end
+
+local function scFindAll()
+    scN, scZ, scB = nil, nil, nil
+    local pg = player:FindFirstChild("PlayerGui")
+    if not pg then return end
+
+    local function grab(g)
+        local check = g:FindFirstChild("Check")
+        local needle = check and check:FindFirstChild("Line")
+        local zone = check and check:FindFirstChild("Goal")
+        if not (needle and zone) then
+            needle, zone = nil, nil
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("GuiObject") then
+                    if not needle and scMatch(d.Name, SC_CFG.needleWords) then
+                        needle = d
+                    elseif not zone and scMatch(d.Name, SC_CFG.zoneWords) then
+                        zone = d
+                    end
+                end
+            end
+        end
+        if needle and zone then
+            scN, scZ = needle, zone
+            for _, d in ipairs(g:GetDescendants()) do
+                if d:IsA("TextButton") or d:IsA("ImageButton") then
+                    scB = d
+                    break
+                end
+            end
+            return true
+        end
+        return false
+    end
+
+    local main = pg:FindFirstChild(SC_CFG.guiName)
+    if main and grab(main) then return end
+    for _, g in ipairs(pg:GetChildren()) do
+        if g ~= gui and g ~= main and g:IsA("ScreenGui") and scMatch(g.Name, SC_CFG.guiWords) then
+            if grab(g) then return end
+        end
+    end
+end
+
+-- the zone of a trap check = the white mark on the ring (solid square, or the solid end of a bar,
+-- or - if nothing is solid - an outlined bar).
+-- returns its angle on the ring (clockwise from up, same space as Line.Rotation), the element and its kind
+-- (2 = solid, 1 = outline), or nil
 local function scFindZoneAngle(force)
     local check = scN and scN.Parent
     if not (check and check:IsA("GuiObject")) then return nil end
-    local R, c = scRingRadius(check)
-    if R <= 0 then return nil end
+    local size = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y)
+    if size <= 0 then return nil end
+    local c = visCenter(scN) -- the needle turns around its own centre
     local now = os.clock()
 
-    -- кэш: элемент ещё на экране и выглядит как метка
+    -- cached element: still valid while it is on screen and still looks like the zone mark
     local obj = scZoneObj
     if not force and obj and now - scZoneScanAt < 0.4
         and obj.Parent and obj:IsDescendantOf(game) and scGuiVisible(obj)
@@ -43,7 +756,7 @@ local function scFindZoneAngle(force)
         return scAngle(visCenter(obj), c), obj, scZoneKind
     end
 
-    -- весь skill check gui (метка может жить вне Check)
+    -- search the whole skill check gui (the second zone look may live outside "Check")
     local root = scN:FindFirstAncestorOfClass("ScreenGui") or check
     local best, bestScore, bestPt, bestKind = nil, -math.huge, nil, 0
     for _, d in ipairs(root:GetDescendants()) do
@@ -51,12 +764,13 @@ local function scFindZoneAngle(force)
             local kind = scVisKind(d)
             if kind > 0 then
                 local sz = math.max(d.AbsoluteSize.X, d.AbsoluteSize.Y)
-                if sz > 0 and sz <= R * 0.7 then            -- маленький элемент, не само кольцо
+                if sz > 0 and sz <= size * 0.4 then
                     local pt = visCenter(d)
                     local dist = (pt - c).Magnitude
-                    if dist >= R * 0.6 and dist <= R * 1.5 then   -- на кольце, не в центре
+                    if dist > size * 0.25 and dist < size * 0.75 then
                         local area = d.AbsoluteSize.X * d.AbsoluteSize.Y
-                        local score = kind * 1e6 - area          -- сплошной белый > контур, потом самый маленький
+                        -- solid beats outline, then the smallest piece wins
+                        local score = kind * 1e6 - area
                         if score > bestScore then
                             best, bestScore, bestPt, bestKind = d, score, pt, kind
                         end
@@ -70,10 +784,8 @@ local function scFindZoneAngle(force)
     return nil
 end
 
----------------------------------------------------------------------
--- блок B: дамп с радиусом кольца, rel = расстояние/радиус, и содержимым Skillcheck-* в персонаже
--- (там может лежать угол зоны текущей проверки)
----------------------------------------------------------------------
+-- lists every element of the skill check gui (name / rotation / position / color); printed and copied to the
+-- clipboard (if the executor has setclipboard) so it can be pasted into a chat
 local function scDumpCheck(why)
     local check = scN and scN.Parent
     if not check then
@@ -81,10 +793,8 @@ local function scDumpCheck(why)
         return
     end
     local root = scN:FindFirstAncestorOfClass("ScreenGui") or check
-    local R, c = scRingRadius(check)
     local out = {}
-    table.insert(out, string.format("[SC] check dump (%s): needle rot=%.0f goal rot=%.0f ringR=%.0f check=%.0fx%.0f",
-        why, scN.Rotation, scZ and scZ.Rotation or 0, R, check.AbsoluteSize.X, check.AbsoluteSize.Y))
+    table.insert(out, string.format("[SC] check dump (%s): needle rot=%.0f goal rot=%.0f", why, scN.Rotation, scZ and scZ.Rotation or 0))
     local n = 0
     for _, d in ipairs(root:GetDescendants()) do
         if d:IsA("GuiObject") then
@@ -97,26 +807,11 @@ local function scDumpCheck(why)
             local col = img and d.ImageColor3 or d.BackgroundColor3
             local tr = img and d.ImageTransparency or d.BackgroundTransparency
             local name = (string.gsub(d:GetFullName(), "^.*SkillCheckPromptGui%.", ""))
-            local rel = R > 0 and (visCenter(d) - c).Magnitude / R or 0
-            table.insert(out, string.format("  %s [%s] vis=%s rot=%.0f pos=%.0f,%.0f size=%.0f,%.0f rel=%.2f col=%d,%d,%d tr=%.2f outline=%s kind=%d",
+            table.insert(out, string.format("  %s [%s] vis=%s rot=%.0f pos=%.0f,%.0f size=%.0f,%.0f col=%d,%d,%d tr=%.2f outline=%s kind=%d",
                 name, d.ClassName, tostring(scGuiVisible(d)), d.Rotation,
-                d.AbsolutePosition.X, d.AbsolutePosition.Y, d.AbsoluteSize.X, d.AbsoluteSize.Y, rel,
+                d.AbsolutePosition.X, d.AbsolutePosition.Y, d.AbsoluteSize.X, d.AbsoluteSize.Y,
                 math.floor(col.R * 255 + 0.5), math.floor(col.G * 255 + 0.5), math.floor(col.B * 255 + 0.5), tr,
                 tostring(scIsOutline(d)), scVisKind(d)))
-        end
-    end
-    local chr = player.Character
-    if chr then
-        for _, ch in ipairs(chr:GetChildren()) do
-            if string.find(string.lower(ch.Name), "skillcheck", 1, true) then
-                local at = {}
-                for k, v in pairs(ch:GetAttributes()) do table.insert(at, k .. "=" .. tostring(v)) end
-                table.insert(out, "  char." .. ch.Name .. " [" .. ch.ClassName .. "] attrs: " .. table.concat(at, ", "))
-                for _, x in ipairs(ch:GetDescendants()) do
-                    local val = x:IsA("ValueBase") and (" = " .. tostring(x.Value)) or ""
-                    table.insert(out, "    " .. x.Name .. " [" .. x.ClassName .. "]" .. val)
-                end
-            end
         end
     end
     for _, line in ipairs(out) do pcall(print, line) end
@@ -127,5 +822,1369 @@ local function scDumpCheck(why)
     scLog("[SC] dump: " .. #out .. " lines" .. (copied and ", copied to clipboard - paste it into the chat" or " (see console)"))
 end
 
--- FILL: если после патча в логе снова "zone mark not found" — вставь сюда содержимое буфера после
--- "[SC] dump: N lines, copied to clipboard" (это структура gui; в самом логе его нет, он только в буфере).
+-- skill check id in the character -> type. add a substring here if the game uses another id
+-- (the real id is printed in F9 as "[SC] press ... id=")
+local SC_IDS = {
+    generator = {"gen"},
+    heal = {"heal"},
+    trap = {"trap"},
+}
+local SC_ORDER = {"generator", "heal", "trap"}
+
+local function scCtxFromChar()
+    local chr = player.Character
+    if not chr then return nil end
+    for _, c in ipairs(chr:GetChildren()) do
+        local n = string.lower(c.Name)
+        if string.find(n, "skillcheck", 1, true) then
+            for _, kind in ipairs(SC_ORDER) do
+                if scMatch(n, SC_IDS[kind]) then return kind, c.Name end
+            end
+            return nil, c.Name
+        end
+    end
+    return nil
+end
+
+---------------------------------------------------------------------
+-- trap skill check
+-- the game reports a trap escape to the server like this (seen in the F9 log):
+--   ReplicatedStorage.Remotes.Killers.<killer>.FreeTrap:FireServer("begin")
+--   ReplicatedStorage.Remotes.Killers.<killer>.TrapSkillResult:FireServer("miss" | "good" | "perfect")  x N
+--   ReplicatedStorage.Remotes.Killers.<killer>.FreeTrap:FireServer("commit")
+-- a "miss" makes the client start over with a new "begin".
+-- two layers work together:
+--   1) the needle: while a trap escape is active the needle logic presses Space on the white zone mark
+--      of EVERY check in the chain (the zone moves after each press, the needle keeps turning), so the
+--      client itself sees a perfect check (works without any executor hooks). The press point corrects
+--      itself after every press: the Space listener below measures where the needle really was when the
+--      game received the key and moves the press point by the error.
+--   2) the remote: the namecall hook (if the executor has it) tracks begin/commit and rewrites any grade the
+--      client reports to "perfect"; if the client reports nothing for TRAP_TIMEOUT seconds while an escape
+--      is active, "perfect" is sent directly
+---------------------------------------------------------------------
+local TRAP_RESULT_NAME = "TrapSkillResult"
+local TRAP_FLOW_NAME = "FreeTrap"
+local TRAP_GRADE = "perfect"
+local TRAP_TIMEOUT = 3.5      -- seconds without a client report before pups reports by itself
+local TRAP_INTERVAL = 1.2     -- minimum seconds between pups' own reports
+local TRAP_ACTIVE_MAX = 30    -- forget "escape active" after this many seconds without a commit
+local scTrapRemote = nil
+local scTrapResultAt = 0
+local scTrapActive = false
+local scTrapActiveAt = 0
+local scTrapLastFire = 0
+
+-- wipe the file left by the earlier remote-learning version (it had the wrong remote saved)
+if writefile and isfile then
+    pcall(function()
+        if isfile("vd_esp_trap_remote.json") then writefile("vd_esp_trap_remote.json", "{}") end
+    end)
+end
+
+local function scSendTrapResult()
+    local r = scTrapRemote
+    if not (r and r.Parent) then
+        r = nil
+        local rs = game:GetService("ReplicatedStorage")
+        for _, d in ipairs((rs:FindFirstChild("Remotes") or rs):GetDescendants()) do
+            if d.Name == TRAP_RESULT_NAME and d:IsA("RemoteEvent") then
+                r = d
+                break
+            end
+        end
+        scTrapRemote = r
+    end
+    if not r then return false end
+    return (pcall(function() r:FireServer(TRAP_GRADE) end))
+end
+
+local scTrapNudge = 0       -- manual extra shift in degrees (the press point corrects itself, so this stays 0)
+local scTrapPressed = false -- we pressed for a trap check and wait for its grade
+local scLastPressSpoof = false
+local scSpoofFails = 0
+local scSpoofToggle = nil   -- menu toggle, set below
+
+local function scTrapGrade(grade)
+    if scTrapPressed then
+        scTrapPressed = false
+        scLog("[SC] trap: our press was graded", grade, scLastPressSpoof and "(spoof)" or "(timing)")
+        if scLastPressSpoof then
+            if grade == "perfect" then
+                scSpoofFails = 0
+            else
+                scSpoofFails = scSpoofFails + 1
+                if scSpoofFails >= 2 then
+                    scSpoofFails = 0
+                    SC.trapSpoof = false
+                    task.spawn(function()
+                        if scSpoofToggle then scSpoofToggle.set(false) end
+                    end)
+                    scLog("[SC] trap: spoof gave no perfect twice -> switched to needle timing")
+                end
+            end
+        end
+    else
+        scLog("[SC] trap: client graded", grade, "without our press")
+    end
+end
+
+local scHookOk = false
+if hookmetamethod and checkcaller and getnamecallmethod then
+    local oldNC
+    scHookOk = pcall(function()
+        oldNC = hookmetamethod(game, "__namecall", (newcclosure or function(f) return f end)(function(self, ...)
+            local method = getnamecallmethod()
+            if scOutAlive and method == "FireServer" and not checkcaller() and typeof(self) == "Instance" then
+                local name = self.Name
+                if name == TRAP_FLOW_NAME then
+                    local step = ...
+                    if step == "begin" then
+                        scTrapActive = true
+                        scTrapActiveAt = os.clock()
+                        scTrapLatchUntil = os.clock() + 6
+                        if SC.trap then scLog("[SC] trap escape begin") end
+                    elseif step == "commit" then
+                        scTrapActive = false
+                        scTrapLatchUntil = 0
+                        if SC.trap then scLog("[SC] trap escape commit") end
+                    end
+                elseif name == TRAP_RESULT_NAME then
+                    scTrapRemote = self
+                    scTrapResultAt = os.clock()
+                    if SC.trap then
+                        local grade = ...
+                        if type(grade) == "string" then
+                            scTrapGrade(grade)
+                            scLog("[SC] trap result", grade, "->", TRAP_GRADE)
+                            if setnamecallmethod then setnamecallmethod(method) end
+                            return oldNC(self, TRAP_GRADE, select(2, ...))
+                        end
+                    end
+                end
+            end
+            return oldNC(self, ...)
+        end))
+    end)
+end
+if not scHookOk then
+    scLog("[SC] trap: hookmetamethod / checkcaller / getnamecallmethod unavailable - trap uses the needle only")
+end
+
+-- Spoof: while a trap press is in flight, anything but pups that reads Line.Rotation gets the angle of the
+-- zone mark instead of the real needle angle, so the game grades the press perfect whatever the timing
+-- (the same way the game reads the needle for generator checks). Active for 0.35 s after each press only.
+local scSpoofAngle, scSpoofAt = nil, 0
+local scIndexOld = nil
+if hookmetamethod and checkcaller and newcclosure then
+    pcall(function()
+        scIndexOld = hookmetamethod(game, "__index", newcclosure(function(self, key)
+            if scSpoofAngle and self == scN and key == "Rotation" and scOutAlive
+                and os.clock() - scSpoofAt < 0.35 and not checkcaller() then
+                local real = scIndexOld(self, key)
+                -- keep the same "lap" as the real value, in case the game does not normalise angles
+                return scSpoofAngle + 360 * math.floor((real - scSpoofAngle) / 360 + 0.5)
+            end
+            return scIndexOld(self, key)
+        end))
+    end)
+end
+local scSpoofReady = scIndexOld ~= nil
+if not scSpoofReady then
+    scLog("[SC] trap: __index hook unavailable - spoof off, using needle timing")
+end
+
+-- trapped state: escape flow seen by the hook, or an attribute on the character / player
+local function scIsTrapped()
+    if scTrapActive and os.clock() - scTrapActiveAt < TRAP_ACTIVE_MAX then
+        return true
+    end
+    local chr = player.Character
+    for _, n in ipairs({"Trapped", "EscapingTrap", "InTrap", "Caught", "Stuck"}) do
+        if (chr and chr:GetAttribute(n) == true) or player:GetAttribute(n) == true then
+            return true
+        end
+    end
+    return false
+end
+
+-- fallback: the client reported nothing for a while during an escape -> report perfect ourselves
+local function scTrapTick()
+    if not scTrapActive then return end
+    local now = os.clock()
+    if now - scTrapActiveAt > TRAP_ACTIVE_MAX then
+        scTrapActive = false
+        return
+    end
+    local quiet = now - math.max(scTrapResultAt, scTrapActiveAt)
+    if quiet > TRAP_TIMEOUT and now - scTrapLastFire > TRAP_INTERVAL then
+        scTrapLastFire = now
+        if scSendTrapResult() then scLog("[SC] trap result sent (client reported none)") end
+    end
+end
+
+-- fallback: nearest object
+local function scCtxProximity()
+    local chr = player.Character
+    local root = chr and chr:FindFirstChild("HumanoidRootPart")
+    if not root then return nil end
+    local pos = root.Position
+
+    local bestKind, bestDist = nil, math.huge
+    local function consider(kind, dist, range)
+        if dist <= range and dist < bestDist then
+            bestKind, bestDist = kind, dist
+        end
+    end
+
+    for _, obj in ipairs(workspace:GetDescendants()) do
+        if obj:IsA("Model") and string.lower(obj.Name) == "generator" and not obj:FindFirstChildOfClass("Humanoid") then
+            local ok, cf = pcall(function() return obj:GetPivot() end)
+            if ok then consider("generator", (cf.Position - pos).Magnitude, SC_CFG.genRange) end
+        end
+    end
+
+    for _, plr in ipairs(Players:GetPlayers()) do
+        if plr ~= player and not espIsKiller(plr) then
+            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
+            if r then consider("heal", (r.Position - pos).Magnitude, SC_CFG.playerRange) end
+        end
+    end
+
+    return bestKind
+end
+
+-- VirtualInputManager first (real input), firesignal only if VIM is missing / failed
+local function scPress()
+    scAutoUntil = os.clock() + 0.2
+    task.spawn(function()
+        local sent = false
+        if VirtualInputManager then
+            sent = pcall(function()
+                VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+                task.wait(0.03)
+                VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+            end)
+        end
+        if not sent and firesignal then
+            pcall(function()
+                firesignal(UserInputService.InputBegan, {
+                    KeyCode = SC_CFG.key,
+                    UserInputType = Enum.UserInputType.Keyboard,
+                }, false)
+            end)
+        end
+        if UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled and scB and firesignal then
+            pcall(function() firesignal(scB.MouseButton1Down) end)
+            pcall(function() firesignal(scB.MouseButton1Click) end)
+            pcall(function() firesignal(scB.Activated) end)
+        end
+    end)
+end
+
+-- Self-calibration of the trap press point.
+-- The key reaches the game some milliseconds after we send it, and the needle keeps moving meanwhile.
+-- When the game receives our Space, this listener reads where the needle really is, compares it with the
+-- centre of the zone we aimed at, and moves the press point by that error (the value is kept between
+-- re-executions in env.__VDTrapOffset).
+connect(UserInputService.InputBegan, function(input)
+    if input.KeyCode ~= SC_CFG.key or not scEvalPending then return end
+    local ev = scEvalPending
+    if os.clock() - ev.t > 0.6 then
+        scEvalPending = nil
+        return
+    end
+    if not (scN and scN.Parent) then return end
+    scEvalPending = nil
+    local ang = scNorm(scN.Rotation)
+    local err = ev.dir * scDiff(ang, ev.zone) -- > 0: the needle was already past the zone centre (too late)
+    local before = scTrapOffset
+    -- small errors are noise: move gently; large errors: move almost fully
+    local gain = math.abs(err) > 6 and 0.9 or 0.6
+    scTrapOffset = math.clamp(scTrapOffset - err * gain, -6, 40)
+    env.__VDTrapOffset = scTrapOffset
+    scLog(string.format("[SC] trap: key landed %.1f deg %s the zone centre | press point %.1f -> %.1f",
+        math.abs(err), err > 0 and "after" or "before", before, scTrapOffset))
+end)
+
+connect(player.CharacterAdded, scReset)
+do
+    local pg0 = player:FindFirstChild("PlayerGui")
+    if pg0 then connect(pg0.ChildAdded, scReset) end
+end
+
+local function scStep(dt)
+    if SC.trap then scTrapTick() end
+
+    if not (SC.generator or SC.heal or SC.trap) then
+        scLast = nil
+        scN, scZ = nil, nil
+        return
+    end
+
+    scT = scT + dt
+    local stale = (not scN) or (not scZ) or (not scN:IsDescendantOf(game)) or (not scZ:IsDescendantOf(game))
+    if (stale and scT >= 0.2) or scT >= 2 then
+        scT = 0
+        scFindAll()
+    end
+
+    if stale or not scN or not scZ or not scGuiVisible(scN) then
+        scLast, scPressed, scCtx, scLastG, scPrevLV, scStill = nil, false, nil, nil, nil, 0
+        scWasMoving = false
+        scLastZone, scZoneSame, scPressZone, scZoneObj = nil, 0, nil, nil
+        scNoZoneDumped = false
+        return
+    end
+
+    local rot = scNorm(scN.Rotation)
+
+    if scPressed then
+        -- new skill check in a chain (the gui stays up, the needle keeps turning): the zone mark jumped to a new
+        -- place, or the needle jumped / went back / stopped, or timeout
+        local waited = os.clock() - scPressTime
+        local step = scLast and scDiff(rot, scLast) or 0
+        local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
+        if scPressSrcFn and scPressSrcV then
+            local v = scPressSrcFn()
+            moved = moved or (v ~= nil and math.abs(scDiff(v, scPressSrcV)) > 1.5)
+        end
+        local zoneMoved = false
+        if scPressZone and waited > 0.04 then
+            local za = scFindZoneAngle(true)
+            if za and math.abs(scDiff(za, scPressZone)) > 4 then zoneMoved = true end
+        end
+        if math.abs(step) < 20 * math.max(dt, 0.001) then scStill = scStill + 1 else scStill = 0 end
+        if zoneMoved or (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2 or scStill >= 3)) or waited > 0.8 then
+            if zoneMoved then scLog("[SC] trap: next check started") end
+            scPressed = false
+            scStill = 0
+            scPrevLV, scLastG = nil, nil
+            scLastZone, scZoneSame, scPressZone = nil, 0, nil
+            scNoZoneDumped = false
+            scReleasedAt = os.clock()
+            scMoveStart = scReleasedAt
+        end
+        scLast = rot
+        return
+    end
+
+    if scLast == nil or dt <= 0 then
+        scLast = rot
+        scSeenAt = os.clock()
+        return
+    end
+
+    local vel = scDiff(rot, scLast) / dt
+    scLast = rot
+    if math.abs(vel) < 20 then scLastG = nil scWasMoving = false return end -- needle is not moving yet
+    if not scWasMoving then
+        scWasMoving = true
+        scMoveStart = os.clock()
+    end
+
+    -- which skill check: trapped state first, then the character id, then (sticky) trap latch, then proximity
+    local ctx, rawId = scCtxFromChar()
+    if scIsTrapped() then
+        ctx = "trap"
+    elseif ctx == "trap" then
+        -- the id says trap
+    elseif not ctx and os.clock() < scTrapLatchUntil then
+        ctx = "trap" -- between two checks of one escape the id may be gone for a moment
+    else
+        if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
+            scCtx = scCtxProximity() or "any"
+        end
+        ctx = ctx or scCtx
+    end
+    if ctx == "trap" then scTrapLatchUntil = os.clock() + 6 end
+    if not ctx then return end
+    if ctx ~= "any" and not SC[ctx] then return end
+
+    local cur, curVel, target, srcFn, tag = rot, vel, nil, nil, ctx
+    local perfect = true
+    local zoneNow = nil
+
+    local tol
+    if ctx == "trap" then
+        -- trap checks are always pressed on the perfect zone. every check of the chain has its own zone,
+        -- so the zone mark is read from the gui; the press point is measured along the needle travel
+        -- direction, so it works whichever way the needle turns
+        perfect = true
+        local dirSign = vel >= 0 and 1 or -1
+        local za, zobj, zkind = scFindZoneAngle(false)
+        if za then
+            scZoneEverFound = true
+            scNoZoneDumped = false
+            if scLastZone and math.abs(scDiff(za, scLastZone)) < 1.5 then
+                scZoneSame = scZoneSame + 1
+            else
+                scZoneSame = 0
+                scLog(string.format("[SC] trap zone at %.0f (needle %.0f) %s: %s", za, rot,
+                    ({"visible", "outline", "solid"})[zkind] or "?", zobj and zobj.Name or "?"))
+            end
+            scLastZone = za
+            if scZoneSame < 2 then return end                  -- wait until the zone stopped moving
+            if os.clock() - scPressTime < 0.2 then return end  -- never press twice in a row
+            zoneNow = za
+
+            if SC.trapSpoof and scSpoofReady then
+                if os.clock() - scMoveStart < 0.15 then return end -- the check has only just started
+                scSpoofAngle, scSpoofAt = za, os.clock()
+                scLog(string.format("[SC] press trap(spoof) zone=%.0f needle=%.0f vel=%d", za, rot, math.floor(vel)))
+                scTrapPressed = true
+                scLastPressSpoof = true
+                scPressZone = za
+                scZoneObj = nil
+                scEvalPending = nil
+                scPressed = true
+                scPressTime = os.clock()
+                scPressDir = vel >= 0 and 1 or -1
+                scPressGoal = scZ.Rotation
+                scPressSrcFn, scPressSrcV = nil, nil
+                scPress()
+                return
+            end
+
+            target = za + dirSign * (scTrapOffset + scTrapNudge)
+            tag = "trap(zone)"
+        elseif scZoneEverFound or os.clock() - scMoveStart < 1.0 then
+            -- zone mark not visible (yet): wait. If it stays missing, dump what is on screen once per check
+            -- so the structure can be read in F9 (no silent stall)
+            if os.clock() - scMoveStart > 0.8 and not scNoZoneDumped then
+                scNoZoneDumped = true
+                scLog("[SC] trap: zone mark not found for this check - dump below")
+                scDumpCheck("zone mark not found")
+            end
+            return
+        else
+            target = scZ.Rotation + dirSign * (SC_CFG.trapZone + scTrapNudge)
+            tag = "trap(fixed)"
+            if not scTrapWarned then
+                scTrapWarned = true
+                scLog("[SC] trap: zone mark not found - using the fixed point (only right for the first check)")
+                scDumpCheck("zone mark not found")
+            end
+        end
+        tol = SC_CFG.trapTol
+    else
+        if ctx == "heal" then
+            perfect = SC.healPerfect
+        else
+            perfect = SC.genPerfect
+        end
+        local center = perfect and SC_CFG.perfectCenter or SC_CFG.normalCenter
+        target = scZ.Rotation + center + SC_CFG.ghExtra
+    end
+
+    tol = tol or (perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
+    local diffNow = scDiff(cur, target)
+    local diffNext = scDiff(cur + curVel * (SC_CFG.lead + dt), target)
+
+    -- press when the needle crosses the target on the next frame or is already inside tolerance
+    local dirNow = curVel >= 0 and 1 or -1
+    local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
+    if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
+        scLog("[SC] press", tag, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
+            "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel),
+            ctx == "trap" and ("offset=" .. string.format("%.1f", scTrapOffset)) or "")
+        if ctx == "trap" then
+            scTrapPressed = true
+            scLastPressSpoof = false
+            scPressZone = zoneNow
+            scZoneObj = nil -- look for the zone mark again after the press
+            -- let the Space listener measure how far from the zone centre the key really landed
+            scEvalPending = zoneNow and {zone = zoneNow, dir = vel >= 0 and 1 or -1, t = os.clock()} or nil
+        end
+        scPressed = true
+        scPressTime = os.clock()
+        scPressDir = vel >= 0 and 1 or -1
+        scPressGoal = scZ.Rotation
+        scPressSrcFn = srcFn
+        scPressSrcV = srcFn and srcFn() or nil
+        scPress()
+    end
+end
+
+---------------------------------------------------------------------
+-- menu window
+---------------------------------------------------------------------
+local main = new("Frame", {
+    Name = "Main",
+    Size = UDim2.fromOffset(380, 470),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.bg,
+    BorderSizePixel = 0,
+    Active = true,
+}, gui)
+corner(main, 14)
+new("UIGradient", {
+    Color = ColorSequence.new(Color3.fromRGB(28, 20, 48), THEME.bg),
+    Rotation = 60,
+}, main)
+
+local scale = new("UIScale", {Scale = 0}, main)
+
+local mainStroke = new("UIStroke", {
+    Thickness = 2,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    Color = Color3.new(1, 1, 1),
+}, main)
+local strokeGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, mainStroke)
+
+local topbar = new("Frame", {
+    Size = UDim2.new(1, 0, 0, 44),
+    BackgroundTransparency = 1,
+    Active = true,
+}, main)
+
+local title = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(18, 0),
+    Size = UDim2.fromOffset(70, 44),
+    Font = Enum.Font.GothamBlack,
+    TextSize = 20,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = Color3.new(1, 1, 1),
+    Text = "pups",
+}, topbar)
+new("UIGradient", {Color = ColorSequence.new(THEME.accent, THEME.accent2)}, title)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(84, 3),
+    Size = UDim2.fromOffset(220, 44),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "Violence District  |  K - menu",
+}, topbar)
+
+local closeBtn = new("TextButton", {
+    Size = UDim2.fromOffset(28, 28),
+    Position = UDim2.new(1, -42, 0, 8),
+    BackgroundColor3 = THEME.item,
+    AutoButtonColor = false,
+    Text = "X",
+    Font = Enum.Font.GothamBold,
+    TextSize = 13,
+    TextColor3 = THEME.dim,
+}, topbar)
+corner(closeBtn, 8)
+
+connect(closeBtn.MouseEnter, function()
+    tween(closeBtn, {BackgroundColor3 = THEME.danger, TextColor3 = Color3.new(1, 1, 1)}, 0.15)
+end)
+connect(closeBtn.MouseLeave, function()
+    tween(closeBtn, {BackgroundColor3 = THEME.item, TextColor3 = THEME.dim}, 0.15)
+end)
+
+local topLine = new("Frame", {
+    Position = UDim2.fromOffset(10, 44),
+    Size = UDim2.new(1, -20, 0, 2),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, main)
+corner(topLine, 1)
+new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, topLine)
+
+local page = new("ScrollingFrame", {
+    Position = UDim2.fromOffset(10, 56),
+    Size = UDim2.new(1, -20, 1, -86),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = THEME.accent,
+    CanvasSize = UDim2.new(),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+}, main)
+new("UIListLayout", {
+    Padding = UDim.new(0, 8),
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, page)
+new("UIPadding", {
+    PaddingRight = UDim.new(0, 6),
+    PaddingTop = UDim.new(0, 2),
+    PaddingBottom = UDim.new(0, 6),
+}, page)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.new(0, 14, 1, -26),
+    Size = UDim2.new(1, -28, 0, 20),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "Click key button to rebind  |  Backspace - clear  |  Esc - cancel",
+}, main)
+
+local function addSection(text)
+    new("TextLabel", {
+        Size = UDim2.new(1, 0, 0, 18),
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.dim,
+        Text = string.upper(text),
+        LayoutOrder = nextOrder(),
+    }, page)
+end
+
+local function addToggle(text, default, callback, bindId, defaultKey)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, bindId and -158 or -80, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local track = new("Frame", {
+        Size = UDim2.fromOffset(44, 22),
+        Position = UDim2.new(1, -58, 0.5, -11),
+        BackgroundColor3 = THEME.off,
+        BorderSizePixel = 0,
+    }, row)
+    corner(track, 11)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(16, 16),
+        Position = UDim2.fromOffset(3, 3),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 8)
+
+    local click = new("TextButton", {
+        Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1,
+        Text = "",
+    }, row)
+
+    local state = default and true or false
+    local obj = {}
+
+    local function render()
+        tween(track, {BackgroundColor3 = state and THEME.accent or THEME.off}, 0.2)
+        tween(knob, {Position = state and UDim2.fromOffset(25, 3) or UDim2.fromOffset(3, 3)}, 0.2, Enum.EasingStyle.Back)
+    end
+
+    function obj.set(v)
+        state = v and true or false
+        render()
+        pcall(callback, state)
+    end
+
+    function obj.get()
+        return state
+    end
+
+    connect(click.Activated, function()
+        obj.set(not state)
+    end)
+
+    if bindId then
+        registerBind(bindId, defaultKey, function()
+            obj.set(not state)
+        end)
+        makeBindButton(row, bindId, UDim2.new(1, -136, 0.5, -12))
+    end
+
+    render()
+    return obj
+end
+
+local function addBindRow(text, id, defaultKey, action)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -100, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+    registerBind(id, defaultKey, action)
+    makeBindButton(row, id, UDim2.new(1, -86, 0.5, -12))
+end
+
+local function addButton(text, callback)
+    local btn = new("TextButton", {
+        Size = UDim2.new(1, 0, 0, 38),
+        BackgroundColor3 = THEME.item,
+        AutoButtonColor = false,
+        Text = text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextColor3 = THEME.text,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(btn, 8)
+
+    connect(btn.MouseEnter, function()
+        tween(btn, {BackgroundColor3 = THEME.hover}, 0.15)
+    end)
+    connect(btn.MouseLeave, function()
+        tween(btn, {BackgroundColor3 = THEME.item}, 0.15)
+    end)
+    connect(btn.Activated, function()
+        btn.BackgroundColor3 = THEME.accent
+        tween(btn, {BackgroundColor3 = THEME.hover}, 0.3)
+        pcall(callback)
+    end)
+    return btn
+end
+
+---------------------------------------------------------------------
+-- color picker (HSV sliders popup)
+---------------------------------------------------------------------
+local colorSwatches = {}
+
+local picker = new("Frame", {
+    Name = "ColorPicker",
+    Size = UDim2.fromOffset(330, 300),
+    Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    BackgroundColor3 = THEME.panel,
+    BorderSizePixel = 0,
+    Visible = false,
+    Active = true,
+    ZIndex = 10,
+}, main)
+corner(picker, 12)
+new("UIStroke", {
+    Thickness = 2,
+    Color = THEME.accent,
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, picker)
+
+local pickerTitle = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 10),
+    Size = UDim2.new(1, -90, 0, 22),
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.text,
+    Text = "Color",
+}, picker)
+
+local preview = new("Frame", {
+    Position = UDim2.new(1, -60, 0, 10),
+    Size = UDim2.fromOffset(44, 22),
+    BackgroundColor3 = Color3.new(1, 1, 1),
+    BorderSizePixel = 0,
+}, picker)
+corner(preview, 6)
+
+local function makeSlider(parent, y, labelText, onChange)
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(16, y),
+        Size = UDim2.fromOffset(20, 20),
+        Font = Enum.Font.GothamBold,
+        TextSize = 12,
+        TextColor3 = THEME.dim,
+        Text = labelText,
+    }, parent)
+
+    local track = new("Frame", {
+        Position = UDim2.fromOffset(40, y + 4),
+        Size = UDim2.new(1, -62, 0, 12),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+        Active = true,
+    }, parent)
+    corner(track, 6)
+    local grad = new("UIGradient", nil, track)
+
+    local knob = new("Frame", {
+        Size = UDim2.fromOffset(10, 20),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0, 0.5),
+        BackgroundColor3 = Color3.new(1, 1, 1),
+        BorderSizePixel = 0,
+    }, track)
+    corner(knob, 4)
+    new("UIStroke", {Thickness = 1.5, Color = Color3.new(0, 0, 0)}, knob)
+
+    local s = {grad = grad}
+    local dragging = false
+
+    function s.set(v)
+        knob.Position = UDim2.fromScale(math.clamp(v, 0, 1), 0.5)
+    end
+
+    local function fromInput(input)
+        local w = track.AbsoluteSize.X
+        if w <= 0 then return end
+        local v = math.clamp((input.Position.X - track.AbsolutePosition.X) / w, 0, 1)
+        s.set(v)
+        onChange(v)
+    end
+
+    connect(track.InputBegan, function(input)
+        if isPointer(input) then
+            dragging = true
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputChanged, function(input)
+        if dragging and isMove(input) then
+            fromInput(input)
+        end
+    end)
+    connect(UserInputService.InputEnded, function(input)
+        if isPointer(input) then
+            dragging = false
+        end
+    end)
+
+    return s
+end
+
+local pickKey = nil
+local hsv = {0, 1, 1}
+local hueS, satS, valS
+
+local rgbLabel = new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 142),
+    Size = UDim2.new(1, -32, 0, 18),
+    Font = Enum.Font.GothamMedium,
+    TextSize = 12,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "",
+}, picker)
+
+local function pickerRender()
+    local h, s, v = hsv[1], hsv[2], hsv[3]
+    local c = Color3.fromHSV(h, s, v)
+    preview.BackgroundColor3 = c
+    satS.grad.Color = ColorSequence.new(Color3.fromHSV(h, 0, v), Color3.fromHSV(h, 1, v))
+    valS.grad.Color = ColorSequence.new(Color3.new(0, 0, 0), Color3.fromHSV(h, s, 1))
+    rgbLabel.Text = string.format(
+        "RGB: %d, %d, %d",
+        math.floor(c.R * 255 + 0.5),
+        math.floor(c.G * 255 + 0.5),
+        math.floor(c.B * 255 + 0.5)
+    )
+end
+
+local function pickerApply()
+    if not pickKey then return end
+    local c = Color3.fromHSV(hsv[1], hsv[2], hsv[3])
+    ESPColors[pickKey] = c
+    if colorSwatches[pickKey] then
+        colorSwatches[pickKey].BackgroundColor3 = c
+    end
+    espApplyColors()
+    pickerRender()
+end
+
+local rainbowKeys = {}
+for i = 0, 6 do
+    table.insert(rainbowKeys, ColorSequenceKeypoint.new(i / 6, Color3.fromHSV(math.min(i / 6, 0.999), 1, 1)))
+end
+
+hueS = makeSlider(picker, 48, "H", function(v)
+    hsv[1] = v
+    pickerApply()
+end)
+hueS.grad.Color = ColorSequence.new(rainbowKeys)
+
+satS = makeSlider(picker, 80, "S", function(v)
+    hsv[2] = v
+    pickerApply()
+end)
+
+valS = makeSlider(picker, 112, "V", function(v)
+    hsv[3] = v
+    pickerApply()
+end)
+
+new("TextLabel", {
+    BackgroundTransparency = 1,
+    Position = UDim2.fromOffset(16, 168),
+    Size = UDim2.fromOffset(100, 16),
+    Font = Enum.Font.GothamBold,
+    TextSize = 11,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextColor3 = THEME.dim,
+    Text = "PRESET COLORS",
+}, picker)
+
+local PRESETS = {
+    Color3.fromRGB(255, 60, 60),
+    Color3.fromRGB(255, 160, 60),
+    Color3.fromRGB(255, 220, 60),
+    Color3.fromRGB(80, 255, 130),
+    Color3.fromRGB(60, 200, 255),
+    Color3.fromRGB(140, 90, 255),
+    Color3.fromRGB(255, 100, 220),
+    Color3.fromRGB(255, 255, 255),
+}
+
+local function pickerLoad(color)
+    local h, s, v = color:ToHSV()
+    hsv = {h, s, v}
+    hueS.set(h)
+    satS.set(s)
+    valS.set(v)
+end
+
+for i, col in ipairs(PRESETS) do
+    local b = new("TextButton", {
+        Position = UDim2.fromOffset(16 + (i - 1) * 38, 190),
+        Size = UDim2.fromOffset(30, 30),
+        BackgroundColor3 = col,
+        AutoButtonColor = false,
+        Text = "",
+    }, picker)
+    corner(b, 8)
+    connect(b.Activated, function()
+        pickerLoad(col)
+        pickerApply()
+    end)
+end
+
+local function closePicker()
+    if picker.Visible then
+        picker.Visible = false
+        saveColors()
+    end
+    pickKey = nil
+end
+
+local doneBtn = new("TextButton", {
+    Position = UDim2.fromOffset(16, 244),
+    Size = UDim2.new(1, -32, 0, 38),
+    BackgroundColor3 = THEME.accent,
+    AutoButtonColor = false,
+    Text = "Done",
+    Font = Enum.Font.GothamBold,
+    TextSize = 14,
+    TextColor3 = Color3.new(1, 1, 1),
+}, picker)
+corner(doneBtn, 8)
+connect(doneBtn.Activated, closePicker)
+
+local function openPicker(key, label)
+    pickKey = key
+    pickerTitle.Text = "Color: " .. label
+    pickerLoad(ESPColors[key])
+    pickerRender()
+    picker.Visible = true
+end
+
+local function addColorRow(text, key)
+    local row = new("Frame", {
+        Size = UDim2.new(1, 0, 0, 40),
+        BackgroundColor3 = THEME.item,
+        BorderSizePixel = 0,
+        LayoutOrder = nextOrder(),
+    }, page)
+    corner(row, 8)
+
+    new("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.fromOffset(14, 0),
+        Size = UDim2.new(1, -80, 1, 0),
+        Font = Enum.Font.GothamMedium,
+        TextSize = 14,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextColor3 = THEME.text,
+        Text = text,
+    }, row)
+
+    local sw = new("TextButton", {
+        Size = UDim2.fromOffset(44, 22),
+        Position = UDim2.new(1, -58, 0.5, -11),
+        BackgroundColor3 = ESPColors[key],
+        AutoButtonColor = false,
+        Text = "",
+    }, row)
+    corner(sw, 6)
+    new("UIStroke", {
+        Thickness = 1,
+        Color = THEME.text,
+        Transparency = 0.6,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, sw)
+
+    colorSwatches[key] = sw
+    connect(sw.Activated, function()
+        openPicker(key, text)
+    end)
+end
+
+---------------------------------------------------------------------
+-- open / close menu
+---------------------------------------------------------------------
+local opened = true
+
+-- Modal button frees the cursor (including first person)
+local modalBtn = new("TextButton", {
+    Size = UDim2.fromOffset(0, 0),
+    BackgroundTransparency = 1,
+    Text = "",
+    Modal = true,
+}, main)
+
+-- remember mouse state at the first force and restore it on close,
+-- otherwise the camera stays in Default and only rotates with RMB
+local prevMouseIcon = UserInputService.MouseIconEnabled
+local prevMouseBehavior = UserInputService.MouseBehavior
+local mouseForced = false
+
+local function mouseRelease()
+    if not mouseForced then
+        prevMouseIcon = UserInputService.MouseIconEnabled
+        prevMouseBehavior = UserInputService.MouseBehavior
+        mouseForced = true
+    end
+end
+
+-- what the game tried to set while the menu was forcing the cursor (round start etc.)
+-- our own forced values are Default / icon on, so anything else is the game's
+local gameBehavior, gameIcon = nil, nil
+connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
+    if opened and mouseForced then
+        local v = UserInputService.MouseBehavior
+        if v ~= Enum.MouseBehavior.Default then gameBehavior = v end
+    end
+end)
+connect(UserInputService:GetPropertyChangedSignal("MouseIconEnabled"), function()
+    if opened and mouseForced and UserInputService.MouseIconEnabled == false then
+        gameIcon = false
+    end
+end)
+
+local function mouseRestore()
+    if not mouseForced then return end
+    mouseForced = false
+    local behavior = gameBehavior or prevMouseBehavior
+    local iconOn = prevMouseIcon
+    if gameIcon ~= nil then iconOn = gameIcon end
+    gameBehavior, gameIcon = nil, nil
+    -- first person lock: the game wants the cursor hidden and centered
+    if player.CameraMode == Enum.CameraMode.LockFirstPerson then
+        behavior = Enum.MouseBehavior.LockCenter
+        iconOn = false
+    end
+    UserInputService.MouseIconEnabled = iconOn
+    UserInputService.MouseBehavior = behavior
+end
+
+local function setOpen(v)
+    opened = v
+    if v then
+        modalBtn.Modal = true
+        main.Visible = true
+        tween(scale, {Scale = 1}, 0.35, Enum.EasingStyle.Back)
+    else
+        closePicker()
+        modalBtn.Modal = false
+        mouseRestore()
+        tween(scale, {Scale = 0}, 0.2)
+        task.delay(0.22, function()
+            if not opened then main.Visible = false end
+        end)
+    end
+end
+
+---------------------------------------------------------------------
+-- floating icon (mobile, works on PC too)
+---------------------------------------------------------------------
+local cam0 = workspace.CurrentCamera
+local vp0 = cam0 and cam0.ViewportSize or Vector2.new(800, 600)
+
+local icon = new("TextButton", {
+    Name = "ToggleIcon",
+    Size = UDim2.fromOffset(50, 50),
+    Position = UDim2.fromOffset(16, math.floor(vp0.Y * 0.35)),
+    BackgroundColor3 = THEME.bg,
+    AutoButtonColor = false,
+    Text = "pups",
+    Font = Enum.Font.GothamBlack,
+    TextSize = 14,
+    TextColor3 = Color3.new(1, 1, 1),
+    ZIndex = 20,
+}, gui)
+corner(icon, 25)
+local iconStroke = new("UIStroke", {
+    Thickness = 2.5,
+    Color = Color3.new(1, 1, 1),
+    ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+}, icon)
+local iconGrad = new("UIGradient", {
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, THEME.accent),
+        ColorSequenceKeypoint.new(0.5, THEME.accent2),
+        ColorSequenceKeypoint.new(1, THEME.accent),
+    }),
+}, iconStroke)
+
+local iconDown, iconMoved = false, false
+local iconStartIn, iconStartPos = nil, nil
+
+connect(icon.InputBegan, function(input)
+    if isPointer(input) then
+        iconDown = true
+        iconMoved = false
+        iconStartIn = input.Position
+        iconStartPos = icon.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if iconDown and isMove(input) then
+        local d = input.Position - iconStartIn
+        if d.Magnitude > 6 then
+            iconMoved = true
+        end
+        if iconMoved then
+            local cam = workspace.CurrentCamera
+            local vp = cam and cam.ViewportSize or Vector2.new(1920, 1080)
+            local size = icon.AbsoluteSize
+            local x = math.clamp(iconStartPos.X.Offset + d.X, 0, vp.X - size.X)
+            local y = math.clamp(iconStartPos.Y.Offset + d.Y, 0, vp.Y - size.Y)
+            icon.Position = UDim2.fromOffset(x, y)
+        end
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if iconDown and isPointer(input) then
+        iconDown = false
+        if not iconMoved then
+            setOpen(not opened)
+        end
+    end
+end)
+
+---------------------------------------------------------------------
+-- menu content
+---------------------------------------------------------------------
+addSection("Players")
+
+addToggle("Survivors", false, function(v)
+    espSet("survivors", v)
+end, "espsurv")
+
+addToggle("Killer", false, function(v)
+    espSet("killer", v)
+end, "espkiller")
+
+addSection("World")
+
+addToggle("Generators", false, function(v)
+    espSet("generators", v)
+end, "espgens")
+
+addSection("ESP Colors")
+
+addColorRow("Survivors", "survivors")
+addColorRow("Killer", "killer")
+addColorRow("Generators", "generators")
+
+addButton("Reset colors", function()
+    for k, v in pairs(DEFAULT_COLORS) do
+        ESPColors[k] = v
+        if colorSwatches[k] then
+            colorSwatches[k].BackgroundColor3 = v
+        end
+    end
+    espApplyColors()
+    saveColors()
+end)
+
+addSection("ESP Settings")
+
+addToggle("Names / distance", true, function(v)
+    ESP.names = v
+end, "espnames")
+
+addSection("Auto Skill Check")
+
+addToggle("Generators", false, function(v)
+    SC.generator = v
+end, "scgen")
+
+addToggle("Generators: perfect (off = normal)", true, function(v)
+    SC.genPerfect = v
+end, "scgenperfect")
+
+addToggle("Heal teammates", false, function(v)
+    SC.heal = v
+end, "scheal")
+
+addToggle("Heal: perfect (off = normal)", true, function(v)
+    SC.healPerfect = v
+end, "schealperfect")
+
+addToggle("Trap release", false, function(v)
+    SC.trap = v
+end, "sctrap")
+
+scSpoofToggle = addToggle("Trap: spoof needle angle", true, function(v)
+    SC.trapSpoof = v
+end, "sctrapspoof")
+
+addButton("Dump skill check GUI (3s delay, F9)", function()
+    scLog("[SC] dump in 3 seconds - get a skill check on screen")
+    task.delay(3, function()
+        scFindAll()
+        scDumpCheck("manual")
+    end)
+end)
+
+addSection("Log")
+
+local logBox = new("TextLabel", {
+    Size = UDim2.new(1, 0, 0, 170),
+    BackgroundColor3 = THEME.item,
+    BorderSizePixel = 0,
+    Font = Enum.Font.Code,
+    TextSize = 11,
+    TextColor3 = THEME.dim,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextYAlignment = Enum.TextYAlignment.Top,
+    TextWrapped = true,
+    Text = "",
+    LayoutOrder = nextOrder(),
+}, page)
+corner(logBox, 8)
+new("UIPadding", {PaddingLeft = UDim.new(0, 8), PaddingTop = UDim.new(0, 6), PaddingRight = UDim.new(0, 8)}, logBox)
+scLogLabel = logBox
+
+addButton("Copy log to clipboard", function()
+    if setclipboard then
+        pcall(setclipboard, table.concat(scLogAll, "\n"))
+        scLog("[SC] log copied to clipboard")
+    else
+        scLog("[SC] setclipboard is not available in this executor")
+    end
+end)
+
+addSection("Settings")
+
+addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
+    setOpen(not opened)
+end)
+
+addButton("Unload pups", function()
+    if env.__VDEspCleanup then env.__VDEspCleanup() end
+end)
+
+connect(closeBtn.Activated, function()
+    setOpen(false)
+end)
+
+tween(scale, {Scale = 1}, 0.5, Enum.EasingStyle.Back)
+
+---------------------------------------------------------------------
+-- dragging (menu window)
+---------------------------------------------------------------------
+local dragging, dragStart, startPos = false, nil, nil
+
+connect(topbar.InputBegan, function(input)
+    if isPointer(input) then
+        dragging = true
+        dragStart = input.Position
+        startPos = main.Position
+    end
+end)
+
+connect(UserInputService.InputChanged, function(input)
+    if dragging and isMove(input) then
+        local d = input.Position - dragStart
+        main.Position = UDim2.new(
+            startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y
+        )
+    end
+end)
+
+connect(UserInputService.InputEnded, function(input)
+    if isPointer(input) then
+        dragging = false
+    end
+end)
+
+connect(RunService.RenderStepped, function(dt)
+    local rot = (os.clock() * 80) % 360
+    strokeGrad.Rotation = rot
+    iconGrad.Rotation = rot
+
+    -- while the menu is open the cursor is visible and unlocked
+    if opened then
+        mouseRelease() -- save game state first, then force
+        if not UserInputService.MouseIconEnabled then
+            UserInputService.MouseIconEnabled = true
+        end
+        if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+        end
+    end
+
+    pcall(scStep, dt)
+end)
+
+---------------------------------------------------------------------
+-- unload
+---------------------------------------------------------------------
+env.__VDEspCleanup = function()
+    saveColors()
+    for k in pairs(ESP) do
+        if k ~= "names" then ESP[k] = false end
+    end
+    espClear()
+
+    SC.generator, SC.heal, SC.trap = false, false, false
+    scOutAlive = false
+    scTrapActive = false
+    pcall(mouseRestore)
+
+    for _, c in ipairs(connections) do
+        pcall(function() c:Disconnect() end)
+    end
+    gui:Destroy()
+    env.__VDEspCleanup = nil
+end
