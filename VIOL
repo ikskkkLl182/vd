@@ -627,10 +627,14 @@ end
 -- check-фрейм, его центр на экране и размер
 local function scBase()
     if not scN then return nil end
+    -- в капкане Line может лежать не прямо в Check / Check может быть нулевого размера:
+    -- поднимаемся вверх до первого GuiObject с ненулевым размером
     local check = scN.Parent
-    if not (check and check:IsA("GuiObject")) then return nil end
+    while check and not (check:IsA("GuiObject") and math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y) > 0) do
+        check = check.Parent
+    end
+    if not check then return nil end
     local size = math.min(check.AbsoluteSize.X, check.AbsoluteSize.Y)
-    if size <= 0 then return nil end
     return check, visCenter(check), size
 end
 
@@ -705,6 +709,87 @@ local function scResolve(root, path)
     return o
 end
 
+-- числа вне GUI: атрибуты player/character/"Skillcheck-*" и ValueBase внутри "Skillcheck-*" (сервер может нести угол зоны там)
+-- A:<tag>@<attr>  tag = player | char | sc      V:<path внутри Skillcheck-*> или V:@self
+local function scFindScInst()
+    local chr = player.Character
+    if not chr then return nil end
+    for _, c in ipairs(chr:GetChildren()) do
+        if string.find(string.lower(c.Name), "skillcheck", 1, true) then return c end
+    end
+    return nil
+end
+
+local function scExtra(vals)
+    local function addAttrs(tag, inst)
+        for k, v in pairs(inst:GetAttributes()) do
+            if type(v) == "number" then vals["A:" .. tag .. "@" .. k] = scNorm(v) end
+        end
+    end
+    addAttrs("player", player)
+    local chr = player.Character
+    if chr then addAttrs("char", chr) end
+    local sc = scFindScInst()
+    if sc then
+        addAttrs("sc", sc)
+        if sc:IsA("ValueBase") and type(sc.Value) == "number" then vals["V:@self"] = scNorm(sc.Value) end
+        for _, d in ipairs(sc:GetDescendants()) do
+            if d:IsA("ValueBase") and type(d.Value) == "number" then
+                vals["V:" .. scPathOf(d, sc)] = scNorm(d.Value)
+            end
+        end
+    end
+end
+
+local function scExtraVal(kind, path)
+    if kind == "A" then
+        local tag, k = string.match(path, "^(%w+)@(.+)$")
+        local inst
+        if tag == "player" then inst = player
+        elseif tag == "char" then inst = player.Character
+        elseif tag == "sc" then inst = scFindScInst() end
+        local v = inst and inst:GetAttribute(k)
+        return type(v) == "number" and scNorm(v) or nil
+    end
+    local sc = scFindScInst()
+    if not sc then return nil end
+    local o = (path == "@self") and sc or scResolve(sc, path)
+    if o and o:IsA("ValueBase") and type(o.Value) == "number" then return scNorm(o.Value) end
+    return nil
+end
+
+-- диагностика: что реально лежит в капкане (печатается и пишется в vd_rec.txt при каждом ручном нажатии)
+local function scDiag()
+    local lines = {}
+    local p = scN and scN.Parent
+    table.insert(lines, string.format("[REC] needle=%s parent=%s(%s) parentSize=%s base=%s",
+        scN and scN:GetFullName() or "nil",
+        p and p.Name or "nil", p and p.ClassName or "nil",
+        (p and p:IsA("GuiObject")) and tostring(p.AbsoluteSize) or "-",
+        tostring(scBase() ~= nil)))
+    local sc = scFindScInst()
+    if sc then
+        table.insert(lines, "[REC] inst " .. sc.ClassName .. " " .. sc:GetFullName())
+        for k, v in pairs(sc:GetAttributes()) do
+            table.insert(lines, "[REC] inst attr " .. k .. "=" .. tostring(v))
+        end
+        for _, d in ipairs(sc:GetDescendants()) do
+            local val = d:IsA("ValueBase") and tostring(d.Value) or ""
+            table.insert(lines, "[REC] inst child " .. d.ClassName .. " " .. scPathOf(d, sc) .. " " .. val)
+        end
+    end
+    if player.Character then
+        for k, v in pairs(player.Character:GetAttributes()) do
+            table.insert(lines, "[REC] char attr " .. k .. "=" .. tostring(v))
+        end
+    end
+    for k, v in pairs(player:GetAttributes()) do
+        table.insert(lines, "[REC] player attr " .. k .. "=" .. tostring(v))
+    end
+    for _, l in ipairs(lines) do warn(l) end
+    if appendfile then pcall(appendfile, "vd_rec.txt", table.concat(lines, "\n") .. "\n") end
+end
+
 -- все числа-кандидаты в Check (без стрелки): Rotation, UIGradient.Rotation, угол на экране
 local function scSnapshot(check, c, size)
     local vals = {}
@@ -730,6 +815,7 @@ end
 
 local function scSrcValue(check, c, kind, path)
     if kind == "T" then return 0 end
+    if kind == "A" or kind == "V" then return scExtraVal(kind, path) end
     local o = scResolve(check, path)
     if not o then return nil end
     if kind == "R" then
@@ -746,6 +832,7 @@ end
 local function scLearnVal()
     local src = SC_LEARN.src
     if not src then return nil end
+    if src.kind == "A" or src.kind == "V" then return scExtraVal(src.kind, src.path) end
     local check, c = scBase()
     if not check then return nil end
     return scSrcValue(check, c, src.kind, src.path)
@@ -820,11 +907,12 @@ end
 
 local function scLearnAdd(rot)
     local check, c, size = scBase()
-    if not check then return end
+    local vals = check and scSnapshot(check, c, size) or {}
+    scExtra(vals)
     local rec = {
         rot = rot,
-        tip = scTipAngle(c, size),
-        vals = scSnapshot(check, c, size),
+        tip = check and scTipAngle(c, size) or nil,
+        vals = vals,
     }
     table.insert(SC_LEARN.recs, rec)
     if #SC_LEARN.recs > 8 then table.remove(SC_LEARN.recs, 1) end
@@ -1185,6 +1273,7 @@ connect(UserInputService.InputBegan, function(input)
     local line = string.format("[REC] ctx=%s id=%s needle=%.1f goal=%.1f diff=%.1f",
         tostring(ctx), tostring(rawId), rot, goal, (rot - goal) % 360)
     warn(line)
+    scDiag()
 
     local check, c, size = scBase()
     if check then
@@ -1199,8 +1288,11 @@ connect(UserInputService.InputBegan, function(input)
         if ctx == "trap" then
             scLearnAdd(rot)
         end
-    elseif appendfile then
-        pcall(appendfile, "vd_rec.txt", line .. "\n")
+    else
+        if appendfile then pcall(appendfile, "vd_rec.txt", line .. "\n") end
+        if ctx == "trap" then
+            scLearnAdd(rot) -- без Check учимся по A:/V: источникам
+        end
     end
 end)
 
