@@ -422,33 +422,6 @@ local function espSet(flag, v)
     espRefreshPlayers()
 end
 
-local function espDump()
-    print("---- ESP dump: players ----")
-    for _, plr in ipairs(Players:GetPlayers()) do
-        local attrs = {}
-        for k, v in pairs(plr:GetAttributes()) do
-            table.insert(attrs, k .. "=" .. tostring(v))
-        end
-        print(plr.Name, "| team:", plr.Team and plr.Team.Name or "none", "| killer:", espIsKiller(plr), "|", table.concat(attrs, ", "))
-    end
-    print("---- ESP dump: model names (count) ----")
-    local counts = {}
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and not obj:FindFirstChildOfClass("Humanoid") then
-            counts[obj.Name] = (counts[obj.Name] or 0) + 1
-        end
-    end
-    local names = {}
-    for n, c in pairs(counts) do
-        if c <= 40 then table.insert(names, n) end
-    end
-    table.sort(names)
-    for _, n in ipairs(names) do
-        print(n, counts[n])
-    end
-    print("---- end ----")
-end
-
 local espT1, espT2 = 0, 0
 connect(RunService.Heartbeat, function(dt)
     espT1 = espT1 + dt
@@ -772,40 +745,6 @@ local function scStep(dt)
         scPressGoal = scZ.Rotation
         scPress()
     end
-end
-
-local function scDump()
-    print("[SC] dump in 3 seconds - trigger a skill check!")
-    task.delay(3, function()
-        local pg = player:FindFirstChild("PlayerGui")
-        if not pg then return end
-        print("---- SC dump ----")
-        local chr = player.Character
-        if chr then
-            local names = {}
-            for _, c in ipairs(chr:GetChildren()) do
-                table.insert(names, c.Name)
-            end
-            print("character children:", table.concat(names, ", "))
-        end
-        for _, g in ipairs(pg:GetChildren()) do
-            if g ~= gui and g:IsA("ScreenGui") and g.Enabled then
-                local matched = scMatch(g.Name, SC_CFG.guiWords)
-                print("ScreenGui:", g.Name, matched and "(match)" or "")
-                if matched then
-                    for _, d in ipairs(g:GetDescendants()) do
-                        if d:IsA("GuiObject") then
-                            print("  ", d:GetFullName(), d.ClassName, "vis:", scGuiVisible(d), "rot:", d.Rotation, "size:", d.AbsoluteSize)
-                        elseif d:IsA("UIGradient") then
-                            print("  ", d:GetFullName(), d.ClassName, "rot:", d.Rotation, "offset:", d.Offset)
-                        end
-                    end
-                end
-            end
-        end
-        print("context(char):", scCtxFromChar(), "| context(near):", scCtxProximity(), "| trapped:", scIsTrapped())
-        print("---- end ----")
-    end)
 end
 
 ---------------------------------------------------------------------
@@ -1383,11 +1322,35 @@ local function mouseRelease()
     end
 end
 
+-- what the game tried to set while the menu was forcing the cursor (round start etc.)
+-- our own forced values are Default / icon on, so anything else is the game's
+local gameBehavior, gameIcon = nil, nil
+connect(UserInputService:GetPropertyChangedSignal("MouseBehavior"), function()
+    if opened and mouseForced then
+        local v = UserInputService.MouseBehavior
+        if v ~= Enum.MouseBehavior.Default then gameBehavior = v end
+    end
+end)
+connect(UserInputService:GetPropertyChangedSignal("MouseIconEnabled"), function()
+    if opened and mouseForced and UserInputService.MouseIconEnabled == false then
+        gameIcon = false
+    end
+end)
+
 local function mouseRestore()
     if not mouseForced then return end
     mouseForced = false
-    UserInputService.MouseIconEnabled = prevMouseIcon
-    UserInputService.MouseBehavior = prevMouseBehavior
+    local behavior = gameBehavior or prevMouseBehavior
+    local iconOn = prevMouseIcon
+    if gameIcon ~= nil then iconOn = gameIcon end
+    gameBehavior, gameIcon = nil, nil
+    -- first person lock: the game wants the cursor hidden and centered
+    if player.CameraMode == Enum.CameraMode.LockFirstPerson then
+        behavior = Enum.MouseBehavior.LockCenter
+        iconOn = false
+    end
+    UserInputService.MouseIconEnabled = iconOn
+    UserInputService.MouseBehavior = behavior
 end
 
 local function setOpen(v)
@@ -1490,7 +1453,7 @@ addToggle("Killer", false, function(v)
     espSet("killer", v)
 end, "espkiller")
 
-addSection("Colors")
+addSection("ESP Colors")
 
 addColorRow("Survivors", "survivors")
 addColorRow("Killer", "killer")
@@ -1505,6 +1468,12 @@ addButton("Reset colors", function()
     espApplyColors()
     saveColors()
 end)
+
+addSection("ESP Settings")
+
+addToggle("Names / distance", true, function(v)
+    ESP.names = v
+end, "espnames")
 
 addSection("Auto Skill Check")
 
@@ -1524,19 +1493,11 @@ addToggle("Heal: perfect (off = normal)", true, function(v)
     SC.healPerfect = v
 end, "schealperfect")
 
-addButton("Dump skill check GUI (3s delay, F9)", scDump)
-
 addSection("Settings")
-
-addToggle("Names / distance", true, function(v)
-    ESP.names = v
-end, "espnames")
 
 addBindRow("Menu key", "menu", Enum.KeyCode.K, function()
     setOpen(not opened)
 end)
-
-addButton("Dump map info (console F9)", espDump)
 
 addButton("Unload pups", function()
     if env.__VDEspCleanup then env.__VDEspCleanup() end
