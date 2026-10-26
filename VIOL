@@ -550,6 +550,8 @@ local SC_CFG = {
     normalTol = 3,
     lead = 0.012,          -- lead time in seconds; late -> lower, early -> higher
     ghExtra = 0,           -- extra target shift (degrees). plus = press later
+    trapCenter = 111,      -- trap: press point from the zone; the side follows the needle direction
+    trapTol = 3.5,         -- trap: tolerance for the press
     genRange = 12,
     playerRange = 12,
 }
@@ -715,6 +717,23 @@ local function scSendTrapResult()
     return (pcall(function() r:FireServer(TRAP_GRADE) end))
 end
 
+local scTrapSide = 1       -- +1 / -1: flips when our press was a miss (learns the mirror side)
+local scTrapPressed = false -- we pressed for a trap check and wait for its grade
+
+local function scTrapGrade(grade)
+    if scTrapPressed then
+        scTrapPressed = false
+        if grade == "miss" then
+            scTrapSide = -scTrapSide
+            print("[SC] trap: our press missed -> side is now", scTrapSide)
+        else
+            print("[SC] trap: our press graded", grade, "(side", scTrapSide .. ")")
+        end
+    else
+        print("[SC] trap: client graded", grade, "without our press")
+    end
+end
+
 local scHookOk = false
 if hookmetamethod and checkcaller and getnamecallmethod then
     local oldNC
@@ -739,6 +758,7 @@ if hookmetamethod and checkcaller and getnamecallmethod then
                     if SC.trap then
                         local grade = ...
                         if type(grade) == "string" then
+                            scTrapGrade(grade)
                             print("[SC] trap result", grade, "->", TRAP_GRADE)
                             if setnamecallmethod then setnamecallmethod(method) end
                             return oldNC(self, TRAP_GRADE, select(2, ...))
@@ -923,10 +943,14 @@ local function scStep(dt)
     local cur, curVel, target, srcFn, tag = rot, vel, nil, nil, ctx
     local perfect = true
 
+    local tol
     if ctx == "trap" then
-        -- trap checks are always pressed on the perfect zone
+        -- trap checks are always pressed on the perfect zone; the zone lies ahead of the needle,
+        -- so the offset sign follows the needle direction (and the learned mirror side)
         perfect = true
-        target = scZ.Rotation + SC_CFG.perfectCenter + SC_CFG.ghExtra
+        local sign = (vel >= 0 and 1 or -1) * scTrapSide
+        target = scZ.Rotation + sign * SC_CFG.trapCenter
+        tol = SC_CFG.trapTol
     else
         if ctx == "heal" then
             perfect = SC.healPerfect
@@ -937,15 +961,18 @@ local function scStep(dt)
         target = scZ.Rotation + center + SC_CFG.ghExtra
     end
 
+    tol = tol or (perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
     local diffNow = scDiff(cur, target)
     local diffNext = scDiff(cur + curVel * (SC_CFG.lead + dt), target)
 
     -- press when the needle crosses the target on the next frame or is already inside tolerance
     local dirNow = curVel >= 0 and 1 or -1
-    local late = diffNow * dirNow > 0 and diffNow * dirNow <= (perfect and SC_CFG.perfectTol or SC_CFG.normalTol)
+    local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
     if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
         print("[SC] press", tag, perfect and "perfect" or "normal", "id=" .. tostring(rawId),
-            "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel))
+            "cur=" .. math.floor(cur), "target=" .. math.floor(target), "goal=" .. math.floor(scZ.Rotation), "vel=" .. math.floor(curVel),
+            ctx == "trap" and ("side=" .. scTrapSide) or "")
+        if ctx == "trap" then scTrapPressed = true end
         scPressed = true
         scPressTime = os.clock()
         scPressDir = vel >= 0 and 1 or -1
