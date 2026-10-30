@@ -290,9 +290,9 @@ local gui = new("ScreenGui", {
 
 local function mount()
     local targets = {
-        function() return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5) end,
         function() return gethui and gethui() end,
         function() return game:GetService("CoreGui") end,
+        function() return player:FindFirstChild("PlayerGui") or player:WaitForChild("PlayerGui", 5) end,
     }
     for _, get in ipairs(targets) do
         local ok, parent = pcall(get)
@@ -303,6 +303,13 @@ local function mount()
     end
 end
 mount()
+
+local function ensureMounted()
+    if not gui then return end
+    -- Keep the menu in the executor UI/CoreGui when available so round resets
+    -- that rebuild PlayerGui do not remove it.
+    if not gui.Parent then mount() end
+end
 
 ---------------------------------------------------------------------
 -- ESP
@@ -457,11 +464,56 @@ connect(workspace.DescendantAdded, function(obj)
     if espIsGenerator(obj) then genSet[obj] = true end
 end)
 
+local function espReadValue(obj, name)
+    if not obj then return nil end
+    local ok, value = pcall(function() return obj:GetAttribute(name) end)
+    if ok and value ~= nil then return value end
+    local child = obj:FindFirstChild(name)
+    if child then
+        local good, result = pcall(function() return child.Value end)
+        if good then return result end
+    end
+    return nil
+end
+
+local function espGeneratorComplete(model)
+    if not model or not model.Parent then return true end
+
+    for _, name in ipairs({"Completed", "IsCompleted", "Repaired", "IsRepaired", "Fixed", "IsFixed"}) do
+        local value = espReadValue(model, name)
+        if value == true then return true end
+    end
+
+    for _, name in ipairs({"RepairProgress", "Progress"}) do
+        local value = espReadValue(model, name)
+        if type(value) == "number" then
+            if value >= 100 or (value > 0 and value <= 1 and value >= 0.999) then
+                return true
+            end
+        end
+    end
+
+    local state = espReadValue(model, "State") or espReadValue(model, "Status")
+    if type(state) == "string" then
+        state = string.lower(state)
+        if state == "complete" or state == "completed" or state == "repaired" or state == "fixed" then
+            return true
+        end
+    end
+    return false
+end
+
 local function espRefreshGenerators()
     local alive = {}
     if ESP.generators then
         for model in pairs(genSet) do
-            if model.Parent then
+            if not model.Parent then
+                genSet[model] = nil
+                espRemove(model)
+            elseif espGeneratorComplete(model) then
+                genSet[model] = nil
+                espRemove(model)
+            else
                 local part = model.PrimaryPart or model:FindFirstChildWhichIsA("BasePart", true)
                 if part then
                     alive[model] = true
@@ -492,8 +544,6 @@ local function espRefreshGenerators()
                         }
                     end
                 end
-            else
-                genSet[model] = nil
             end
         end
     end
@@ -541,7 +591,8 @@ connect(RunService.Heartbeat, function(dt)
 end)
 
 ---------------------------------------------------------------------
--- auto skill check (single toggle, works on PC and mobile)
+-- Auto skill checks: detects each visible check independently.
+-- King checks are treated as consecutive ordinary checks; no server remotes.
 ---------------------------------------------------------------------
 local VirtualInputManager = nil
 pcall(function()
@@ -550,7 +601,7 @@ end)
 
 local SC = {
     enabled = false,
-    perfect = true, -- true = perfect (white zone), false = normal
+    perfect = true,
 }
 
 local SC_CFG = {
@@ -559,33 +610,28 @@ local SC_CFG = {
     needleWords = {"line", "needle", "pointer", "hand", "arrow", "marker"},
     zoneWords = {"goal", "zone", "success", "target"},
     key = Enum.KeyCode.Space,
-    genRange = 12,
-    playerRange = 12,
-    mobileLead = 0.03, -- fixed, matches reference script, no UI
-    actionPath = "Survivor-mob.Controls.action.check", -- fixed mobile button path, from reference script
+    mobileLead = 0.025,
+    actionPath = "Survivor-mob.Controls.action.check",
     touchId = 8822,
 }
 
-local function scMakeTiming()
-    return {
-        perfectCenter = 111,
-        perfectTol = 3.5,
-        normalCenter = 127,
-        normalTol = 3,
-        lead = 0.012,
-        extra = 0,
-    }
-end
-local SC_TIMING = scMakeTiming()
+local SC_TIMING = {
+    perfectCenter = 111,
+    perfectTol = 4,
+    normalCenter = 127,
+    normalTol = 4,
+    lead = 0.012,
+    extra = 0,
+}
 
 local function scIsMobile()
     return UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled
 end
 
 local function scMatch(name, words)
-    name = string.lower(name)
-    for _, w in ipairs(words) do
-        if string.find(name, w, 1, true) then return true end
+    name = string.lower(tostring(name or ""))
+    for _, word in ipairs(words) do
+        if string.find(name, word, 1, true) then return true end
     end
     return false
 end
@@ -608,170 +654,135 @@ local function scDiff(a, b)
     return ((a - b + 180) % 360) - 180
 end
 
--- fixed-path mobile button, same lookup pattern as the reference script's GetActionTarget
-local function scGetFixedButton()
-    local pg = player:FindFirstChild("PlayerGui")
+local function scGetActionButton()
+    local pg = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+    if not pg then return nil end
+
     local current = pg
     for segment in string.gmatch(SC_CFG.actionPath, "[^%.]+") do
         current = current and current:FindFirstChild(segment)
     end
-    if current and current:IsA("GuiObject") then
+    if current and current:IsA("GuiObject") and scGuiVisible(current) then
         return current
     end
-    return nil
+
+    -- UI paths can differ between device layouts/game updates; search visible action buttons.
+    local best, bestScore = nil, -math.huge
+    for _, item in ipairs(pg:GetDescendants()) do
+        if (item:IsA("TextButton") or item:IsA("ImageButton")) and scGuiVisible(item) then
+            local n = string.lower(item.Name)
+            local score = 0
+            if n == "check" then score = score + 8 end
+            if string.find(n, "action", 1, true) then score = score + 5 end
+            if string.find(n, "check", 1, true) then score = score + 4 end
+            if string.find(n, "skill", 1, true) then score = score + 3 end
+            if item.AbsoluteSize.X > 0 and item.AbsoluteSize.Y > 0 then
+                score = score + 1
+            end
+            if score > bestScore then best, bestScore = item, score end
+        end
+    end
+    return bestScore >= 4 and best or nil
 end
 
 local scN, scZ, scB = nil, nil, nil
-local scLast, scPressed, scPressTime, scCtx, scSeenAt = nil, false, 0, nil, 0
-local scT = 0
-local scPressDir, scPressGoal = 1, nil
-local scStill = 0
+local scLast, scLastGoal = nil, nil
+local scLastAt = 0
+local scFired = false
+local scPressTime = 0
+local scRefreshAt = 0
+local scVelocity = 0
 
 local function scReset()
     scN, scZ, scB = nil, nil, nil
-    scLast, scPressed, scCtx, scStill = nil, false, nil, 0
-    scT = 1
+    scLast, scLastGoal = nil, nil
+    scLastAt = 0
+    scFired = false
+    scPressTime = 0
+    scRefreshAt = 0
+    scVelocity = 0
 end
 
 local function scFindAll()
     scN, scZ, scB = nil, nil, nil
-    local pg = player:FindFirstChild("PlayerGui")
-    if not pg then return end
+    local pg = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+    if not pg then return false end
 
-    local function grab(g)
-        local check = g:FindFirstChild("Check")
-        local needle = check and check:FindFirstChild("Line")
-        local zone = check and check:FindFirstChild("Goal")
+    local function inspect(screen)
+        local check = screen:FindFirstChild("Check", true)
+        local needle = check and check:FindFirstChild("Line", true)
+        local zone = check and check:FindFirstChild("Goal", true)
+
         if not (needle and zone) then
-            needle, zone = nil, nil
-            for _, d in ipairs(g:GetDescendants()) do
+            for _, d in ipairs(screen:GetDescendants()) do
                 if d:IsA("GuiObject") then
-                    if not needle and scMatch(d.Name, SC_CFG.needleWords) then
-                        needle = d
-                    elseif not zone and scMatch(d.Name, SC_CFG.zoneWords) then
-                        zone = d
-                    end
+                    if not needle and scMatch(d.Name, SC_CFG.needleWords) then needle = d end
+                    if not zone and scMatch(d.Name, SC_CFG.zoneWords) then zone = d end
                 end
             end
         end
-        if needle and zone then
+
+        if needle and zone and needle:IsA("GuiObject") and zone:IsA("GuiObject") then
             scN, scZ = needle, zone
-            scB = scGetFixedButton()
-            if not scB then
-                local firstBtn
-                for _, d in ipairs(g:GetDescendants()) do
-                    if d:IsA("TextButton") or d:IsA("ImageButton") then
-                        firstBtn = firstBtn or d
-                        if scGuiVisible(d) then
-                            scB = d
-                            break
-                        end
-                    end
-                end
-                scB = scB or firstBtn
-            end
+            scB = scGetActionButton()
             return true
         end
         return false
     end
 
-    local main = pg:FindFirstChild(SC_CFG.guiName)
-    if main and grab(main) then return end
-    for _, g in ipairs(pg:GetChildren()) do
-        if g ~= gui and g ~= main and g:IsA("ScreenGui") and scMatch(g.Name, SC_CFG.guiWords) then
-            if grab(g) then return end
+    local mainPrompt = pg:FindFirstChild(SC_CFG.guiName)
+    if mainPrompt and inspect(mainPrompt) then return true end
+
+    for _, child in ipairs(pg:GetChildren()) do
+        if child:IsA("ScreenGui") and scMatch(child.Name, SC_CFG.guiWords) then
+            if inspect(child) then return true end
         end
     end
+    return false
 end
 
-local SC_IDS = {
-    generator = {"gen"},
-    heal = {"heal"},
-    trap = {"trap"},
-}
-local SC_ORDER = {"generator", "heal", "trap"}
-
-local function scCtxFromChar()
+local function scIsTrapCheck()
     local chr = player.Character
-    if not chr then return nil end
-    for _, c in ipairs(chr:GetChildren()) do
-        local n = string.lower(c.Name)
-        if string.find(n, "skillcheck", 1, true) then
-            for _, kind in ipairs(SC_ORDER) do
-                if scMatch(n, SC_IDS[kind]) then return kind, c.Name end
-            end
-            return nil, c.Name
+    if not chr then return false end
+    for _, child in ipairs(chr:GetChildren()) do
+        local n = string.lower(child.Name)
+        if string.find(n, "skillcheck", 1, true) and string.find(n, "trap", 1, true) then
+            return true
         end
     end
-    return nil
+    return false
 end
 
-local function scCtxProximity()
-    local chr = player.Character
-    local root = chr and chr:FindFirstChild("HumanoidRootPart")
-    if not root then return nil end
-    local pos = root.Position
-
-    local bestKind, bestDist = nil, math.huge
-    local function consider(kind, dist, range)
-        if dist <= range and dist < bestDist then
-            bestKind, bestDist = kind, dist
-        end
-    end
-
-    for _, obj in ipairs(workspace:GetDescendants()) do
-        if obj:IsA("Model") and string.lower(obj.Name) == "generator" and not obj:FindFirstChildOfClass("Humanoid") then
-            local ok, cf = pcall(function() return obj:GetPivot() end)
-            if ok then consider("generator", (cf.Position - pos).Magnitude, SC_CFG.genRange) end
-        end
-    end
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        if plr ~= player and not espIsKiller(plr) then
-            local r = plr.Character and plr.Character:FindFirstChild("HumanoidRootPart")
-            if r then consider("heal", (r.Position - pos).Magnitude, SC_CFG.playerRange) end
-        end
-    end
-
-    return bestKind
+local function scPressKey()
+    if not VirtualInputManager then return false end
+    local ok = pcall(function()
+        VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
+        task.wait(0.025)
+        VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
+    end)
+    return ok
 end
 
--- PC path: VirtualInputManager first (real input), firesignal only if VIM is missing / failed. unchanged.
-local function scKeyPress()
-    local sent = false
-    if VirtualInputManager then
-        sent = pcall(function()
-            VirtualInputManager:SendKeyEvent(true, SC_CFG.key, false, game)
-            task.wait(0.03)
-            VirtualInputManager:SendKeyEvent(false, SC_CFG.key, false, game)
-        end)
-    end
-    if not sent and firesignal then
-        pcall(function()
-            firesignal(UserInputService.InputBegan, {
-                KeyCode = SC_CFG.key,
-                UserInputType = Enum.UserInputType.Keyboard,
-            }, false)
-        end)
-    end
-end
-
--- mobile: screen-space center of the button, both insets applied like the reference script
-local function scButtonCenter()
-    if not (scB and scB:IsDescendantOf(game)) then return nil end
-    local p, s = scB.AbsolutePosition, scB.AbsoluteSize
-    local inset = GuiService:GetGuiInset()
-    return p.X + s.X / 2 + inset.X, p.Y + s.Y / 2 + inset.Y
-end
-
--- fixed-path tap, matching the reference script's TriggerMobileButton (touch, no mouse fallback)
 local function scTapButton()
-    local x, y = scButtonCenter()
-    if not (x and VirtualInputManager) then return false end
+    scB = (scB and scB.Parent and scGuiVisible(scB)) and scB or scGetActionButton()
+    if not scB or not VirtualInputManager then return false end
+
+    local p, size = scB.AbsolutePosition, scB.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then return false end
+
+    local inset = Vector2.zero
+    local screenGui = scB:FindFirstAncestorOfClass("ScreenGui")
+    if screenGui and not screenGui.IgnoreGuiInset then
+        local topLeft = GuiService:GetGuiInset()
+        inset = Vector2.new(topLeft.X, topLeft.Y)
+    end
+    local x = p.X + size.X / 2 + inset.X
+    local y = p.Y + size.Y / 2 + inset.Y
+
     return pcall(function()
-        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, x, y) -- 0 = Begin
-        task.wait(0.01)
-        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, x, y) -- 2 = End
+        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 0, x, y)
+        task.wait(0.015)
+        VirtualInputManager:SendTouchEvent(SC_CFG.touchId, 2, x, y)
     end)
 end
 
@@ -780,86 +791,164 @@ local function scPress()
         if scIsMobile() then
             if scTapButton() then return end
         end
-        scKeyPress()
+        scPressKey()
     end)
 end
 
 connect(player.CharacterAdded, scReset)
 do
-    local pg0 = player:FindFirstChild("PlayerGui")
-    if pg0 then connect(pg0.ChildAdded, scReset) end
+    local pg = player:FindFirstChildOfClass("PlayerGui") or player:FindFirstChild("PlayerGui")
+    if pg then connect(pg.ChildAdded, scReset) end
 end
 
 local function scStep(dt)
     if not SC.enabled then
-        scLast = nil
-        scN, scZ = nil, nil
+        scReset()
         return
     end
 
-    scT = scT + dt
-    local stale = (not scN) or (not scZ) or (not scN:IsDescendantOf(game)) or (not scZ:IsDescendantOf(game))
-    if (stale and scT >= 0.2) or scT >= 2 then
-        scT = 0
+    local now = os.clock()
+    local stale = not scN or not scZ
+        or not scN:IsDescendantOf(game)
+        or not scZ:IsDescendantOf(game)
+
+    if stale or now >= scRefreshAt then
+        scRefreshAt = now + 0.15
         scFindAll()
     end
 
-    if stale or not scN or not scZ or not scGuiVisible(scN) then
-        scLast, scPressed, scCtx, scStill = nil, false, nil, 0
+    if not scN or not scZ or not scGuiVisible(scN) or not scGuiVisible(scZ) then
+        scReset()
+        return
+    end
+
+    if scIsTrapCheck() then
+        scLast = scNorm(scN.Rotation)
+        scLastGoal = scNorm(scZ.Rotation)
+        scLastAt = now
         return
     end
 
     local rot = scNorm(scN.Rotation)
+    local goal = scNorm(scZ.Rotation)
 
-    if scPressed then
-        local waited = os.clock() - scPressTime
-        local step = scLast and scDiff(rot, scLast) or 0
-        local moved = scPressGoal and math.abs(scDiff(scZ.Rotation, scPressGoal)) > 0.5
-        if math.abs(step) < 20 * math.max(dt, 0.001) then scStill = scStill + 1 else scStill = 0 end
-        if (waited > 0.25 and (moved or math.abs(step) > 60 or step * scPressDir < -2 or scStill >= 3)) or waited > 0.8 then
-            scPressed = false
-            scStill = 0
+    if scLast == nil or scLastAt == 0 then
+        scLast, scLastGoal, scLastAt = rot, goal, now
+        scFired = false
+        return
+    end
+
+    local elapsed = math.max(now - scLastAt, dt, 1 / 240)
+    local delta = scDiff(rot, scLast)
+    local velocity = delta / elapsed
+    local previousVelocity = scVelocity
+    -- Ignore tiny UI animation jitter, but adapt automatically to faster consecutive checks.
+    if math.abs(velocity) >= 12 then
+        scVelocity = velocity
+    end
+
+    -- A new check in a King sequence may keep the prompt open but reset the needle
+    -- or move the target. Re-arm as soon as that transition is observed.
+    local goalChanged = math.abs(scDiff(goal, scLastGoal or goal)) >= 1.5
+    local needleReset = math.abs(delta) > 35 and previousVelocity ~= 0 and delta * previousVelocity < 0
+    local targetCenter = SC.perfect and SC_TIMING.perfectCenter or SC_TIMING.normalCenter
+    local target = scNorm(goal + targetCenter + SC_TIMING.extra)
+    local distanceFromTarget = math.abs(scDiff(rot, target))
+
+    if scFired then
+        if goalChanged or needleReset or (now - scPressTime >= 0.11 and distanceFromTarget >= 38) then
+            scFired = false
+        else
+            scLast, scLastGoal, scLastAt = rot, goal, now
+            return
         end
-        scLast = rot
+    end
+
+    if math.abs(velocity) < 12 then
+        scLast, scLastGoal, scLastAt = rot, goal, now
         return
     end
 
-    if scLast == nil or dt <= 0 then
-        scLast = rot
-        scSeenAt = os.clock()
-        return
-    end
-
-    local vel = scDiff(rot, scLast) / dt
-    scLast = rot
-    if math.abs(vel) < 20 then return end
-
-    local ctx, rawId = scCtxFromChar()
-    if not ctx and scCtx == nil and (rawId or os.clock() - scSeenAt > 0.25) then
-        scCtx = scCtxProximity() or "any"
-    end
-    ctx = ctx or scCtx
-    if not ctx then return end
-    if ctx == "trap" then return end
-
-    local center = SC.perfect and SC_TIMING.perfectCenter or SC_TIMING.normalCenter
-    local tol = SC.perfect and SC_TIMING.perfectTol or SC_TIMING.normalTol
     local lead = SC_TIMING.lead + (scIsMobile() and SC_CFG.mobileLead or 0)
-    local target = scZ.Rotation + center + SC_TIMING.extra
+    local predicted = scNorm(rot + velocity * (lead + elapsed))
+    local dNow = scDiff(target, rot)
+    local dPredicted = scDiff(target, predicted)
+    local crossed = (dNow == 0) or (dNow * dPredicted <= 0 and math.abs(dNow) < 55)
+    local tolerance = SC.perfect and SC_TIMING.perfectTol or SC_TIMING.normalTol
+    local nearAndMovingToward = math.abs(dNow) <= tolerance and (dNow * velocity > 0)
 
-    local diffNow = scDiff(rot, target)
-    local diffNext = scDiff(rot + vel * (lead + dt), target)
-
-    local dirNow = vel >= 0 and 1 or -1
-    local late = diffNow * dirNow > 0 and diffNow * dirNow <= tol
-    if (diffNow * diffNext <= 0 and math.abs(diffNow) < 40) or late then
-        scPressed = true
-        scPressTime = os.clock()
-        scPressDir = dirNow
-        scPressGoal = scZ.Rotation
+    if crossed or nearAndMovingToward then
+        scFired = true
+        scPressTime = now
         scPress()
     end
+
+    scLast, scLastGoal, scLastAt = rot, goal, now
 end
+
+---------------------------------------------------------------------
+-- Local speed-effect control.
+-- This changes the local Humanoid WalkSpeed only; it does not create a
+-- server-authoritative game status effect or bypass server validation.
+---------------------------------------------------------------------
+local SPEED = {
+    enabled = false,
+    multiplier = 1.00,
+    humanoid = nil,
+    base = nil,
+    lastApplied = nil,
+    applying = false,
+}
+
+local function speedAttach(character)
+    SPEED.humanoid = nil
+    SPEED.base = nil
+    SPEED.lastApplied = nil
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    if not hum and character then
+        hum = character:WaitForChild("Humanoid", 5)
+    end
+    if hum then
+        SPEED.humanoid = hum
+        SPEED.base = hum.WalkSpeed
+    end
+end
+
+local function speedApply()
+    local hum = SPEED.humanoid
+    if not hum or not hum.Parent then return end
+    if not SPEED.enabled then
+        if SPEED.base then
+            SPEED.applying = true
+            pcall(function() hum.WalkSpeed = SPEED.base end)
+            SPEED.applying = false
+        end
+        SPEED.lastApplied = nil
+        return
+    end
+    local mult = math.clamp(SPEED.multiplier, 1, 1.30)
+    if SPEED.base == nil then SPEED.base = hum.WalkSpeed end
+    -- If the game updates its underlying speed, use that as the new base.
+    if SPEED.lastApplied and not SPEED.applying
+        and math.abs(hum.WalkSpeed - SPEED.lastApplied) > 0.5 then
+        SPEED.base = hum.WalkSpeed
+    end
+    local wanted = SPEED.base * mult
+    if math.abs(hum.WalkSpeed - wanted) > 0.05 then
+        SPEED.applying = true
+        pcall(function() hum.WalkSpeed = wanted end)
+        SPEED.applying = false
+    end
+    SPEED.lastApplied = wanted
+end
+
+connect(player.CharacterAdded, function(character)
+    task.spawn(function()
+        speedAttach(character)
+        speedApply()
+    end)
+end)
+if player.Character then task.spawn(speedAttach, player.Character) end
 
 ---------------------------------------------------------------------
 -- menu window
@@ -1696,6 +1785,16 @@ addSlider("Timing shift (deg)", -10, 10, 0, 0.5, "%+.1f", function(v)
     SC_TIMING.extra = v
 end)
 
+addSection("Movement")
+addToggle("Speed effect (local)", false, function(v)
+    SPEED.enabled = v
+    speedApply()
+end, "speedfx")
+addSlider("Speed multiplier", 100, 130, 100, 5, "%d%%", function(v)
+    SPEED.multiplier = math.clamp(v / 100, 1, 1.30)
+    speedApply()
+end)
+
 addSection("Settings")
 
 addSlider("Menu size", MENU_SCALE_MIN * 100, MENU_SCALE_MAX * 100, math.floor(menuScale * 100 + 0.5), 5, "%d%%", function() end, function(v)
@@ -1749,7 +1848,15 @@ connect(UserInputService.InputEnded, function(input)
     end
 end)
 
+local maintenanceTimer = 0
 connect(RunService.RenderStepped, function(dt)
+    maintenanceTimer = maintenanceTimer + dt
+    if maintenanceTimer >= 0.5 then
+        maintenanceTimer = 0
+        ensureMounted()
+        speedApply()
+    end
+
     local rot = (os.clock() * 80) % 360
     strokeGrad.Rotation = rot
     iconGrad.Rotation = rot
@@ -1779,6 +1886,8 @@ env.__VDEspCleanup = function()
     espClear()
 
     SC.enabled = false
+    SPEED.enabled = false
+    pcall(speedApply)
     pcall(mouseRestore)
 
     for _, c in ipairs(connections) do
